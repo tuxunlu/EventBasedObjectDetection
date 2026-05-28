@@ -1,6 +1,7 @@
 /dataset
 /lightning_logs
 /venv
+/EventBasedObjectDetection
 *.DS_Store
 
 # The following lines are from the github Python.gitignore template

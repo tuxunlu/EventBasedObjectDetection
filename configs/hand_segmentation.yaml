@@ -1,0 +1,112 @@
+# Phase A scaffold: dataset + dataloader fully wired for event/teacher-mask pairs.
+# The MODEL section is a placeholder; Phase B replaces it with EventUnet / EventSsm
+# and switches the loss to BCE+Dice in model_interface.py.
+
+TRAINING:
+  deterministic: False
+  use_compile: False
+  inference_mode: False
+  seed: 42
+  max_epochs: 50
+
+DISTRIBUTED:
+  accelerator: gpu
+  devices: 1
+  num_nodes: 1
+  strategy: auto
+
+DATA:
+  dataset:
+    file_name: hand_event_dataset
+    class_name: HandEventDataset
+    dataset_init_args:
+      root_dir: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNew
+      voxel_bins: 5
+      window_ms: 36.0
+      image_height: 480
+      image_width: 640
+      held_out_subject: tuxun       # LOSO held-out subject for val/test
+      require_teacher: True         # set False before running sam2_pseudo_labels.py
+      action_only: False
+      mask_root: /fs/nexus-scratch/tuxunlu/teacher_masks   # writable location for SAM 2 outputs
+      # Carry through fields used by the placeholder MODEL section below.
+      num_classes: 1
+      augmentation:
+        enabled: False
+        probability: 0.0
+  dataloader:
+    batch_size: 8
+    test_batch_size: 4
+    num_workers: 4
+    persistent_workers: True
+    pin_memory: True
+    multiprocessing_context: fork
+    drop_last: True
+    shuffle_train: True
+    shuffle_val: False
+    shuffle_test: False
+
+# --- PLACEHOLDER: replace in Phase B ---------------------------------------
+# SimpleNet is wrong for segmentation — included only so `main.py` can
+# import this config without error. Do NOT train with it.
+MODEL:
+  file_name: simple_net
+  class_name: SimpleNet
+  model_init_args:
+    in_channels: 5                  # = voxel_bins
+    num_classes: 1
+    input_meta:
+      image_height: 480
+      image_width: 640
+      num_classes: 1
+    blocks:
+      block1:
+        hidden_channels: [16, 32]
+      block2:
+        hidden_channels: [32, 64]
+      block3:
+        hidden_channels: [64]
+# ---------------------------------------------------------------------------
+
+OPTIMIZER:
+  name: AdamW
+  arguments:
+    lr: 3e-4
+    weight_decay: 1e-4
+  gradient_accumulation:
+    enabled: False
+    scheduling: {0: 4, 4: 2, 8: 1}
+  gradient_clip:
+    enabled: True
+    gradient_clip_val: 1.0
+    gradient_clip_algorithm: norm
+  stochastic_weight_averaging:
+    enabled: False
+    swa_lrs: 1e-2
+
+SCHEDULER:
+  learning_rate:
+    enabled: True
+    name: CosineAnnealingLR
+    arguments:
+      T_max: 50
+      eta_min: 1e-6
+  early_stopping:
+    enabled: False
+    monitor: val_loss_epoch
+    mode: min
+    patience: 5
+    min_delta: 1e-5
+
+LOGGER:
+  log_dir_root: lightning_logs
+  experiment_name: hand_segmentation_phaseA_scaffold
+
+CHECKPOINT:
+  enabled: True
+  every_n_epochs: 1
+  monitor: val_loss_epoch
+  mode: min
+  filename: "best-{epoch:03d}-{val_loss_epoch:.5f}"
+  save_top_k: 1
+  save_last: True
