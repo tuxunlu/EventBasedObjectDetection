@@ -478,7 +478,7 @@ def process_sequence(
     n_probes: int = 8,
     min_score: float = 0.30,
     min_area_frac: float = 0.01,
-    write_preview: bool = True,
+    write_preview: bool = False,
     preview_fps: Optional[float] = None,
     preview_window_ms: float = 33.0,
     input_modality: str = "rgb",
@@ -595,6 +595,13 @@ def main(argv: List[str] | None = None) -> int:
                         default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--overwrite", action="store_true",
                         help="Re-run on sequences whose mask dir already contains files")
+    parser.add_argument("--shard", type=str, default=None,
+                        help="Process only shard 'i/N' (0-indexed) of the sorted "
+                             "sequence list. Use for multi-GPU runs: launch N "
+                             "processes with --shard 0/N, 1/N, ..., (N-1)/N, "
+                             "each pinned to a distinct GPU via "
+                             "CUDA_VISIBLE_DEVICES. Avoids the race where "
+                             "concurrent workers both pick up the same sequence.")
     parser.add_argument("--glob", type=str, default="sequence_*",
                         help="Glob filter when using --root")
     parser.add_argument("--mask_root", type=str, default=None,
@@ -659,12 +666,26 @@ def main(argv: List[str] | None = None) -> int:
         print("[fatal] no sequences matched", file=sys.stderr)
         return 1
 
+    shard_tag = ""
+    if args.shard is not None:
+        try:
+            shard_i, shard_n = (int(x) for x in args.shard.split("/"))
+        except ValueError:
+            parser.error(f"--shard expects 'i/N' (integers), got {args.shard!r}")
+        if not (shard_n > 0 and 0 <= shard_i < shard_n):
+            parser.error(f"--shard {args.shard!r}: require 0 <= i < N and N > 0")
+        sequences = [s for k, s in enumerate(sequences) if k % shard_n == shard_i]
+        shard_tag = f" [shard {shard_i}/{shard_n}]"
+        if not sequences:
+            print(f"[fatal] shard {args.shard} is empty", file=sys.stderr)
+            return 1
+
     print(f"[load] GroundingDINO ({args.gd_model_id}) on {device}")
     detector = GroundingDinoDetector(device=device, model_id=args.gd_model_id)
     print(f"[load] SAM 2 ({sam2_checkpoint.name}, cfg={args.sam2_config}) on {device}")
     sam2_predictor = build_sam2_predictor(sam2_checkpoint, args.sam2_config, device)
 
-    print(f"[run] {len(sequences)} sequence(s)")
+    print(f"[run]{shard_tag} {len(sequences)} sequence(s)")
     failed = 0
     for seq in sequences:
         try:

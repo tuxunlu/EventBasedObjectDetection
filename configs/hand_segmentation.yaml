@@ -1,6 +1,6 @@
-# Phase A scaffold: dataset + dataloader fully wired for event/teacher-mask pairs.
-# The MODEL section is a placeholder; Phase B replaces it with EventUnet / EventSsm
-# and switches the loss to BCE+Dice in model_interface.py.
+# Phase B baseline: HandEventDataset + EventUnet (ANN) + BCE+Dice distillation.
+# Switching TRAINING.task to "segmentation" tells ModelInterface to use the
+# 3-tuple (voxel, mask, meta) batch contract and the DistillationLoss path.
 
 TRAINING:
   deterministic: False
@@ -8,10 +8,11 @@ TRAINING:
   inference_mode: False
   seed: 42
   max_epochs: 50
+  task: segmentation
 
 DISTRIBUTED:
   accelerator: gpu
-  devices: 1
+  devices: 4
   num_nodes: 1
   strategy: auto
 
@@ -46,27 +47,15 @@ DATA:
     shuffle_val: False
     shuffle_test: False
 
-# --- PLACEHOLDER: replace in Phase B ---------------------------------------
-# SimpleNet is wrong for segmentation — included only so `main.py` can
-# import this config without error. Do NOT train with it.
 MODEL:
-  file_name: simple_net
-  class_name: SimpleNet
+  file_name: event_unet
+  class_name: EventUnet
   model_init_args:
     in_channels: 5                  # = voxel_bins
+    # 0.4M params at this width; landing in the plan's 0.4–0.8M target band.
+    # Drop to [32, 64, 96, 128] for a ~118K-param ablation variant.
+    encoder_channels: [64, 128, 192, 256]
     num_classes: 1
-    input_meta:
-      image_height: 480
-      image_width: 640
-      num_classes: 1
-    blocks:
-      block1:
-        hidden_channels: [16, 32]
-      block2:
-        hidden_channels: [32, 64]
-      block3:
-        hidden_channels: [64]
-# ---------------------------------------------------------------------------
 
 OPTIMIZER:
   name: AdamW
@@ -100,13 +89,15 @@ SCHEDULER:
 
 LOGGER:
   log_dir_root: lightning_logs
-  experiment_name: hand_segmentation_phaseA_scaffold
+  experiment_name: hand_segmentation_phaseB_eventunet
 
 CHECKPOINT:
   enabled: True
   every_n_epochs: 1
-  monitor: val_loss_epoch
-  mode: min
-  filename: "best-{epoch:03d}-{val_loss_epoch:.5f}"
+  # Segmentation: highest mIoU wins. Switch back to val_loss_epoch if you
+  # prefer loss-based selection.
+  monitor: val_iou_epoch
+  mode: max
+  filename: "best-{epoch:03d}-{val_iou_epoch:.4f}"
   save_top_k: 1
   save_last: True

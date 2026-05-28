@@ -6,7 +6,9 @@ import torch
 import lightning.pytorch as pl
 
 from loss.loss_funcs import cross_entropy_loss
+from loss.distillation import DistillationLoss
 from torchmetrics.functional.classification import multiclass_accuracy
+from utils.metrics.segmentation import binary_iou, binary_dice, boundary_f_score
 from configs.sections import (
     ModelConfig,
     OptimizerConfig,
@@ -17,6 +19,8 @@ from configs.sections import (
 
 
 class ModelInterface(pl.LightningModule):
+    SUPPORTED_TASKS = ("classification", "segmentation")
+
     def __init__(
         self,
         model_cfg: ModelConfig,
@@ -31,6 +35,11 @@ class ModelInterface(pl.LightningModule):
         self.scheduler_cfg = scheduler_cfg
         self.training_cfg = training_cfg
         self.data_cfg = data_cfg
+        self.task = getattr(training_cfg, "task", "classification")
+        if self.task not in self.SUPPORTED_TASKS:
+            raise ValueError(
+                f"TRAINING.task={self.task!r} not in {self.SUPPORTED_TASKS}"
+            )
         self.num_classes = self.data_cfg.dataset.dataset_init_args["num_classes"]
 
         self.save_hyperparameters(
@@ -44,7 +53,13 @@ class ModelInterface(pl.LightningModule):
         )
 
         self.model = self.__load_model()
-        self.loss_function = self.__configure_loss()
+        if self.task == "segmentation":
+            # Phase B: BCE + Dice only; Phase C will turn on the motion /
+            # temporal / feature terms via the same module.
+            self.seg_loss = DistillationLoss(bce_weight=1.0, dice_weight=1.0)
+            self.loss_function = None  # not used in segmentation path
+        else:
+            self.loss_function = self.__configure_loss()
 
     def forward(self, x):
         return self.model(x)
@@ -63,58 +78,72 @@ class ModelInterface(pl.LightningModule):
     # 3. If sync_dist=True, logger will average metrics across devices. This introduces additional communication overhead, and not suggested for large metric tensors.
     # We can also define customized metrics aggregator for incremental step-level aggregation(to be merged into epoch-level metrics).
     def training_step(self, batch, batch_idx):
-        train_input, train_labels = batch
-        train_out_logits = self(train_input)
-        train_loss = self.loss_function(train_out_logits, train_labels, 'train')
-
-        train_step_top1_acc = multiclass_accuracy(train_out_logits, train_labels, num_classes=self.num_classes, average='micro', top_k=1)
-        train_step_top5_acc = multiclass_accuracy(train_out_logits, train_labels, num_classes=self.num_classes, average='micro', top_k=5)
-        self.log('train_top1_acc', value=train_step_top1_acc, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=train_input.shape[0])
-        self.log('train_top5_acc', value=train_step_top5_acc, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=train_input.shape[0])
-
-        train_step_output = {
-            'loss': train_loss,
-            'pred': train_out_logits,
-            'ground_truth': train_labels
-        }
-
-        return train_step_output
+        if self.task == "segmentation":
+            return self._segmentation_step(batch, "train")
+        return self._classification_step(batch, "train")
 
     # Caution: self.model.eval() is invoked and this function executes within a <with torch.no_grad()> context
     def validation_step(self, batch, batch_idx):
-        val_input, val_labels = batch
-        val_out_logits = self(val_input)
-        val_loss = self.loss_function(val_out_logits, val_labels, 'val')
-        val_step_top1_acc = multiclass_accuracy(val_out_logits, val_labels, num_classes=self.num_classes, average='micro', top_k=1)
-        val_step_top5_acc = multiclass_accuracy(val_out_logits, val_labels, num_classes=self.num_classes, average='micro', top_k=5)
-        self.log('val_top1_acc', value=val_step_top1_acc, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=val_input.shape[0])
-        self.log('val_top5_acc', value=val_step_top5_acc, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=val_input.shape[0])
-
-        val_step_output = {
-            'loss': val_loss,
-            'pred': val_out_logits,
-            'ground_truth': val_labels
-        }
-
-        return val_step_output
+        if self.task == "segmentation":
+            return self._segmentation_step(batch, "val")
+        return self._classification_step(batch, "val")
 
     # Caution: self.model.eval() is invoked and this function executes within a <with torch.no_grad()> context
     def test_step(self, batch, batch_idx):
-        test_input, test_labels = batch
-        test_out_logits = self(test_input)
-        test_loss = self.loss_function(test_out_logits, test_labels, 'test')
-        test_step_top1_acc = multiclass_accuracy(test_out_logits, test_labels, num_classes=self.num_classes, average='micro', top_k=1)
-        test_step_top5_acc = multiclass_accuracy(test_out_logits, test_labels, num_classes=self.num_classes, average='micro', top_k=5)
-        self.log('test_top1_acc', value=test_step_top1_acc, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=test_input.shape[0])
-        self.log('test_top5_acc', value=test_step_top5_acc, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=test_input.shape[0])
+        if self.task == "segmentation":
+            return self._segmentation_step(batch, "test")
+        return self._classification_step(batch, "test")
 
-        test_step_output = {
-            'loss': test_loss,
-            'pred': test_out_logits,
-            'ground_truth': test_labels
-        }
+    def _classification_step(self, batch, stage):
+        x, labels = batch
+        logits = self(x)
+        loss = self.loss_function(logits, labels, stage)
 
-        return test_step_output
+        top1 = multiclass_accuracy(logits, labels, num_classes=self.num_classes,
+                                   average='micro', top_k=1)
+        top5 = multiclass_accuracy(logits, labels, num_classes=self.num_classes,
+                                   average='micro', top_k=5)
+        self.log(f'{stage}_top1_acc', top1, on_step=True, on_epoch=True,
+                 prog_bar=True, sync_dist=True, batch_size=x.shape[0])
+        self.log(f'{stage}_top5_acc', top5, on_step=True, on_epoch=True,
+                 prog_bar=True, sync_dist=True, batch_size=x.shape[0])
+
+        return {'loss': loss, 'pred': logits, 'ground_truth': labels}
+
+    def _segmentation_step(self, batch, stage):
+        # HandEventDataset yields (voxel(B,H,W), mask(H,W), meta_dict). Default
+        # collate gives voxel(N,B,H,W), mask(N,H,W), meta_dict_of_lists.
+        if len(batch) == 3:
+            voxel, mask, _meta = batch
+        else:
+            voxel, mask = batch  # tolerate a 2-tuple form
+        logits = self(voxel)  # (N, 1, H, W)
+
+        terms = self.seg_loss(logits, mask)
+        loss = terms["total"]
+
+        bs = voxel.shape[0]
+        self.log(f'{stage}_loss', loss, on_step=True, on_epoch=True,
+                 prog_bar=True, sync_dist=True, batch_size=bs)
+        self.log(f'{stage}_bce_loss', terms["bce"], on_step=True, on_epoch=True,
+                 prog_bar=False, sync_dist=True, batch_size=bs)
+        self.log(f'{stage}_dice_loss', terms["dice"], on_step=True, on_epoch=True,
+                 prog_bar=False, sync_dist=True, batch_size=bs)
+
+        # Cheap eval metric every step; boundary-F only during val/test to keep
+        # training step fast.
+        iou = binary_iou(logits.detach(), mask)
+        self.log(f'{stage}_iou', iou, on_step=True, on_epoch=True,
+                 prog_bar=True, sync_dist=True, batch_size=bs)
+        if stage != "train":
+            dice = binary_dice(logits.detach(), mask)
+            bf = boundary_f_score(logits.detach(), mask, d_tolerance=2)
+            self.log(f'{stage}_dice', dice, on_step=False, on_epoch=True,
+                     prog_bar=True, sync_dist=True, batch_size=bs)
+            self.log(f'{stage}_boundary_f', bf, on_step=False, on_epoch=True,
+                     prog_bar=False, sync_dist=True, batch_size=bs)
+
+        return {'loss': loss, 'pred': logits, 'ground_truth': mask}
 
     def configure_optimizers(self):
         # https://docs.pytorch.org/docs/2.8/generated/torch.optim.Adam.html
