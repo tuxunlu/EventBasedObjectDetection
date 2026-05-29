@@ -263,11 +263,66 @@ def find_best_seed(
         # foreground hand/arm is BOTH confident AND large.
         img_area = float(h * w)
         rank = sum(s * float(np.sqrt(_box_area(b) / img_area)) for b, _l, s in fg)
+        # Strongly prefer frames that carry BOTH a hand and a (non-hand) arm box, so
+        # SAM 2 gets seeded with the full hand+arm rather than the hand alone.
+        phrases = {l.strip().lower() for _b, l, _s in fg}
+        has_hand = any("hand" in p for p in phrases)
+        has_arm = any("arm" in p and "hand" not in p for p in phrases)
+        if has_hand and has_arm:
+            rank *= 2.0
         if rank > best_rank:
             best_idx = idx
             best_boxes = fg
             best_rank = rank
     return best_idx, best_boxes
+
+
+def augment_with_arm(
+    detector: "GroundingDinoDetector",
+    frame_path: Path,
+    boxes: List[Tuple[List[float], str, float]],
+    min_score: float,
+    min_area_frac: float,
+    text_threshold: float = 0.15,
+) -> List[Tuple[List[float], str, float]]:
+    """If the seed has a hand but no arm, recover the arm with a relaxed pass.
+
+    GroundingDINO scores 'arm' lower than 'hand', so at the seed threshold the arm
+    box often drops out — leaving SAM 2 to propagate a hand-only mask. Here we re-run
+    GroundingDINO on the seed frame with an arm-only prompt and a lowered threshold,
+    then graft on the largest arm box that sits near the kept hand (guarding against
+    a background person's arm).
+    """
+    labels = {l.strip().lower() for _b, l, _s in boxes}
+    if any("arm" in p and "hand" not in p for p in labels):
+        return boxes  # already have an arm
+    hand = next(((b, l, s) for b, l, s in boxes if "hand" in l.strip().lower()), None)
+    if hand is None:
+        return boxes  # nothing to anchor an arm to
+
+    rgb = load_frame_rgb(frame_path)
+    h, w = rgb.shape[:2]
+    relaxed = detector(
+        rgb, prompt="arm. forearm.",
+        box_threshold=max(0.10, min_score - 0.15),
+        text_threshold=text_threshold,
+    )
+    cand = keep_foreground_boxes(
+        relaxed, h, w, min_area_frac=0.5 * min_area_frac, associate_arm_to_hand=False
+    )
+    if not cand:
+        return boxes
+
+    hx, hy = _box_center(hand[0])
+    diag = float(np.hypot(h, w))
+    near = [
+        (b, l, s) for b, l, s in cand
+        if float(np.hypot(_box_center(b)[0] - hx, _box_center(b)[1] - hy)) < 0.5 * diag
+    ]
+    if not near:
+        return boxes
+    arm = max(near, key=lambda t: _box_area(t[0]))
+    return list(boxes) + [arm]
 
 
 def run_sam2_video(
@@ -544,6 +599,11 @@ def process_sequence(
             print(f"[warn] {sequence_dir.name}: GroundingDINO found nothing for {prompt!r} "
                   f"across {len(candidates)} probes ({input_modality} input); skipping.")
             return
+        # Guarantee the arm is seeded: GroundingDINO often returns only the hand at
+        # the chosen frame, which would propagate a hand-only mask.
+        boxes = augment_with_arm(
+            detector, input_files[seed_idx], boxes, min_score, min_area_frac,
+        )
         print(f"[seed] {sequence_dir.name}: chose frame {seed_idx}")
         for xyxy, label, score in boxes:
             print(f"        box {label!r} {score:.2f} {xyxy}")
