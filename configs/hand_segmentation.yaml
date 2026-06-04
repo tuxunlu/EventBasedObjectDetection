@@ -29,16 +29,16 @@ DATA:
       held_out_subject: tuxun       # LOSO held-out subject for val/test
       require_teacher: True         # set False before running sam2_pseudo_labels.py
       action_only: False
-      mask_root: /fs/nexus-scratch/tuxunlu/teacher_masks   # writable location for SAM 2 outputs
+      mask_root: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNewTeacherMasks   # complete SAM 2 teacher masks
       # Carry through fields used by the placeholder MODEL section below.
       num_classes: 1
       augmentation:
         enabled: False
         probability: 0.0
   dataloader:
-    batch_size: 8
+    batch_size: 12
     test_batch_size: 4
-    num_workers: 4
+    num_workers: 8
     persistent_workers: True
     pin_memory: True
     multiprocessing_context: fork
