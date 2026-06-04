@@ -32,11 +32,18 @@ DATA:
       mask_root: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNewTeacherMasks   # complete SAM 2 teacher masks
       # Carry through fields used by the placeholder MODEL section below.
       num_classes: 1
+      # Train-only spatial augmentation. Off for val/test regardless. Combats
+      # the LOSO subject-identity gap by preventing the network from memorizing
+      # per-subject hand pose / position.
       augmentation:
-        enabled: False
-        probability: 0.0
+        enabled: True
+        hflip_prob: 0.5
+        affine_prob: 0.5
+        rotate_deg: 10.0
+        scale_range: [0.9, 1.1]
+        translate_frac: 0.05
   dataloader:
-    batch_size: 12
+    batch_size: 4
     test_batch_size: 4
     num_workers: 8
     persistent_workers: True
@@ -56,6 +63,13 @@ MODEL:
     # Drop to [32, 64, 96, 128] for a ~118K-param ablation variant.
     encoder_channels: [64, 128, 192, 256]
     num_classes: 1
+    # GroupNorm preferred over BatchNorm for LOSO: no running statistics, so
+    # the held-out subject's voxel distribution isn't normalized by training-
+    # subject means. Bump groups upward (e.g. 16) for finer-grained channel
+    # normalization if needed; clamped to the largest divisor of the channel
+    # width automatically.
+    norm: gn
+    gn_groups: 8
 
 OPTIMIZER:
   name: AdamW

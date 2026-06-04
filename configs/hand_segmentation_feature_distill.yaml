@@ -1,0 +1,132 @@
+# Feature-distillation variant of Phase B.
+#
+# Differences vs configs/hand_segmentation.yaml:
+#   - MODEL = EventTinySeg (tiny pre-filter, ~24K inference params).
+#   - DATA.provide_rgb = True (HandEventDataset now returns 4-tuples that
+#     include the paired FLIR RGB frame).
+#   - TRAINING.teacher_config set → ModelInterface builds the frozen SAM 2
+#     image encoder, switches the loss to FeatureDistillationLoss, and runs
+#     the teacher online on every step.
+#
+# Expect: ~5× slower steps than mask-only training because SAM 2 image
+# encoder dominates. Cached SAM 2 masks (Phase A output) are still used for
+# the mask sub-loss; only the encoder features are computed online.
+
+TRAINING:
+  deterministic: False
+  use_compile: False
+  inference_mode: False
+  seed: 42
+  max_epochs: 30
+  task: segmentation
+  teacher_config:
+    type: sam2_image_encoder
+    checkpoint: /fs/nexus-scratch/tuxunlu/git/EventBasedObjectDetection/sam2_hiera_large.pt
+    config: sam2_hiera_l.yaml
+    input_size: 1024
+    mask_weight: 1.0
+    align_weights:
+      low: 0.5
+      mid: 1.0
+      high: 1.0
+
+DISTRIBUTED:
+  accelerator: gpu
+  devices: 4
+  num_nodes: 1
+  strategy: auto
+
+DATA:
+  dataset:
+    file_name: hand_event_dataset
+    class_name: HandEventDataset
+    dataset_init_args:
+      root_dir: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNew
+      voxel_bins: 5
+      window_ms: 36.0
+      image_height: 480
+      image_width: 640
+      held_out_subject: tuxun
+      require_teacher: True
+      action_only: False
+      mask_root: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNewTeacherMasks
+      num_classes: 1
+      provide_rgb: True       # ← deliver paired RGB to ModelInterface
+      augmentation:
+        enabled: True
+        hflip_prob: 0.5
+        affine_prob: 0.5
+        rotate_deg: 10.0
+        scale_range: [0.9, 1.1]
+        translate_frac: 0.05
+  dataloader:
+    # Smaller batch — SAM 2 image encoder activations dominate memory.
+    batch_size: 2
+    test_batch_size: 2
+    num_workers: 4
+    persistent_workers: True
+    pin_memory: True
+    multiprocessing_context: fork
+    drop_last: True
+    shuffle_train: True
+    shuffle_val: False
+    shuffle_test: False
+
+MODEL:
+  file_name: event_tiny_seg
+  class_name: EventTinySeg
+  model_init_args:
+    in_channels: 5
+    stage_channels: [16, 24, 32, 48, 64]   # ~24K inference params
+    num_classes: 1
+    output_stride: 4                       # 120×160 pre-filter output
+    head_mid_channels: 32
+    norm: gn
+    gn_groups: 4
+    align_dims:
+      low: 256                             # matches SAM 2 FPN d_model
+      mid: 256
+      high: 256
+
+OPTIMIZER:
+  name: AdamW
+  arguments:
+    lr: 3e-4
+    weight_decay: 1e-4
+  gradient_accumulation:
+    enabled: False
+    scheduling: {0: 4, 4: 2, 8: 1}
+  gradient_clip:
+    enabled: True
+    gradient_clip_val: 1.0
+    gradient_clip_algorithm: norm
+  stochastic_weight_averaging:
+    enabled: False
+    swa_lrs: 1e-2
+
+SCHEDULER:
+  learning_rate:
+    enabled: True
+    name: CosineAnnealingLR
+    arguments:
+      T_max: 30
+      eta_min: 1e-6
+  early_stopping:
+    enabled: False
+    monitor: val_loss_epoch
+    mode: min
+    patience: 5
+    min_delta: 1e-5
+
+LOGGER:
+  log_dir_root: lightning_logs
+  experiment_name: hand_segmentation_phaseB_tinyseg_sam2distill
+
+CHECKPOINT:
+  enabled: True
+  every_n_epochs: 1
+  monitor: val_iou_epoch
+  mode: max
+  filename: "best-{epoch:03d}-{val_iou_epoch:.4f}"
+  save_top_k: 1
+  save_last: True

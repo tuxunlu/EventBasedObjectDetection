@@ -7,6 +7,7 @@ import lightning.pytorch as pl
 
 from loss.loss_funcs import cross_entropy_loss
 from loss.distillation import DistillationLoss
+from loss.feature_distillation import FeatureDistillationLoss
 from torchmetrics.functional.classification import multiclass_accuracy
 from utils.metrics.segmentation import binary_iou, binary_dice, boundary_f_score
 from configs.sections import (
@@ -53,10 +54,24 @@ class ModelInterface(pl.LightningModule):
         )
 
         self.model = self.__load_model()
+        self.teacher = None
+        self.feature_distill_loss = None
         if self.task == "segmentation":
-            # Phase B: BCE + Dice only; Phase C will turn on the motion /
-            # temporal / feature terms via the same module.
-            self.seg_loss = DistillationLoss(bce_weight=1.0, dice_weight=1.0)
+            teacher_cfg = getattr(training_cfg, "teacher_config", None)
+            if teacher_cfg:
+                self.teacher = self.__build_teacher(teacher_cfg)
+                self.feature_distill_loss = FeatureDistillationLoss(
+                    mask_weight=float(teacher_cfg.get("mask_weight", 1.0)),
+                    align_weights=dict(teacher_cfg.get("align_weights", {
+                        "low": 0.5, "mid": 1.0, "high": 1.0,
+                    })),
+                )
+                # The cached-mask DistillationLoss is unused on this path; keep
+                # the attribute set to None so __getstate__ stays simple.
+                self.seg_loss = None
+            else:
+                # Phase B path: BCE + Dice only on cached SAM 2 masks.
+                self.seg_loss = DistillationLoss(bce_weight=1.0, dice_weight=1.0)
             self.loss_function = None  # not used in segmentation path
         else:
             self.loss_function = self.__configure_loss()
@@ -79,18 +94,24 @@ class ModelInterface(pl.LightningModule):
     # We can also define customized metrics aggregator for incremental step-level aggregation(to be merged into epoch-level metrics).
     def training_step(self, batch, batch_idx):
         if self.task == "segmentation":
+            if self.teacher is not None:
+                return self._feature_distillation_step(batch, "train")
             return self._segmentation_step(batch, "train")
         return self._classification_step(batch, "train")
 
     # Caution: self.model.eval() is invoked and this function executes within a <with torch.no_grad()> context
     def validation_step(self, batch, batch_idx):
         if self.task == "segmentation":
+            if self.teacher is not None:
+                return self._feature_distillation_step(batch, "val")
             return self._segmentation_step(batch, "val")
         return self._classification_step(batch, "val")
 
     # Caution: self.model.eval() is invoked and this function executes within a <with torch.no_grad()> context
     def test_step(self, batch, batch_idx):
         if self.task == "segmentation":
+            if self.teacher is not None:
+                return self._feature_distillation_step(batch, "test")
             return self._segmentation_step(batch, "test")
         return self._classification_step(batch, "test")
 
@@ -144,6 +165,89 @@ class ModelInterface(pl.LightningModule):
                      prog_bar=False, sync_dist=True, batch_size=bs)
 
         return {'loss': loss, 'pred': logits, 'ground_truth': mask}
+
+    def _feature_distillation_step(self, batch, stage):
+        """Online feature distillation: SAM 2 image encoder on RGB → student features.
+
+        Batch contract: ``(voxel(N,B,H,W), mask(N,H,W), rgb(N,3,H,W), meta)``
+        produced by ``HandEventDataset(provide_rgb=True)`` + default collate.
+
+        The student must expose ``forward_with_features(voxel) -> (logits, feats_dict)``
+        with keys aligned to the teacher's. ``EventTinySeg`` matches this contract.
+        """
+        if len(batch) != 4:
+            raise ValueError(
+                f"feature-distillation expects 4-tuple (voxel, mask, rgb, meta); "
+                f"got {len(batch)}-tuple. Did you set DATA.dataset.dataset_init_args."
+                f"provide_rgb: True ?"
+            )
+        voxel, mask, rgb, _meta = batch
+
+        if not hasattr(self.model, "forward_with_features"):
+            raise TypeError(
+                f"model {type(self.model).__name__} has no forward_with_features(); "
+                "use EventTinySeg or another distillation-aware model when "
+                "teacher_config is set."
+            )
+        logits, student_feats = self.model.forward_with_features(voxel)
+
+        # Teacher: frozen, no grad, no autocast (let SAM 2 use its own dtype).
+        with torch.no_grad():
+            teacher_feats = self.teacher(rgb)
+
+        terms = self.feature_distill_loss(
+            mask_logits=logits,
+            student_feats=student_feats,
+            teacher_mask=mask,
+            teacher_feats=teacher_feats,
+        )
+        loss = terms["total"]
+
+        bs = voxel.shape[0]
+        self.log(f'{stage}_loss', loss, on_step=True, on_epoch=True,
+                 prog_bar=True, sync_dist=True, batch_size=bs)
+        self.log(f'{stage}_bce_loss', terms["bce"], on_step=True, on_epoch=True,
+                 prog_bar=False, sync_dist=True, batch_size=bs)
+        self.log(f'{stage}_dice_loss', terms["dice"], on_step=True, on_epoch=True,
+                 prog_bar=False, sync_dist=True, batch_size=bs)
+        for k in ("align_low", "align_mid", "align_high", "align_total"):
+            if k in terms:
+                self.log(f'{stage}_{k}', terms[k], on_step=True, on_epoch=True,
+                         prog_bar=False, sync_dist=True, batch_size=bs)
+
+        # IoU here is at the student's output stride (e.g. stride-4 for
+        # EventTinySeg); the mask target is downsampled inside the loss but
+        # logits are still student-resolution, so we downsample the mask
+        # ourselves for the metric.
+        import torch.nn.functional as F
+        with torch.no_grad():
+            tgt = F.interpolate(mask.unsqueeze(1).float(),
+                                size=logits.shape[-2:],
+                                mode="nearest").squeeze(1)
+            iou = binary_iou(logits.detach(), tgt)
+            self.log(f'{stage}_iou', iou, on_step=True, on_epoch=True,
+                     prog_bar=True, sync_dist=True, batch_size=bs)
+            if stage != "train":
+                dice = binary_dice(logits.detach(), tgt)
+                bf = boundary_f_score(logits.detach(), tgt, d_tolerance=2)
+                self.log(f'{stage}_dice', dice, on_step=False, on_epoch=True,
+                         prog_bar=True, sync_dist=True, batch_size=bs)
+                self.log(f'{stage}_boundary_f', bf, on_step=False, on_epoch=True,
+                         prog_bar=False, sync_dist=True, batch_size=bs)
+
+        return {'loss': loss, 'pred': logits, 'ground_truth': mask}
+
+    def __build_teacher(self, teacher_cfg):
+        """Construct the configured online teacher. Currently SAM 2 only."""
+        kind = teacher_cfg.get("type", "sam2_image_encoder")
+        if kind != "sam2_image_encoder":
+            raise ValueError(f"unsupported teacher type: {kind!r}")
+        from model.sam2_teacher import Sam2ImageEncoderTeacher
+        return Sam2ImageEncoderTeacher(
+            checkpoint_path=teacher_cfg["checkpoint"],
+            config_name=teacher_cfg["config"],
+            input_size=int(teacher_cfg.get("input_size", 1024)),
+        )
 
     def configure_optimizers(self):
         # https://docs.pytorch.org/docs/2.8/generated/torch.optim.Adam.html

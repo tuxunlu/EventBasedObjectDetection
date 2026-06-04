@@ -24,33 +24,54 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class _DWSepConv(nn.Module):
-    """Depthwise 3×3 + BN + ReLU + pointwise 1×1 + BN + ReLU."""
+def _make_norm(c: int, kind: str, gn_groups: int) -> nn.Module:
+    """Factory for the normalization layer used throughout the encoder/decoder.
 
-    def __init__(self, c_in: int, c_out: int, stride: int = 1):
+    ``"gn"`` is preferred for LOSO training: it has no running statistics,
+    so the held-out subject's voxel distribution doesn't get rescaled by
+    training-subject means. Pick group count that divides the channel width.
+    """
+    if kind == "bn":
+        return nn.BatchNorm2d(c)
+    if kind == "gn":
+        g = min(gn_groups, c)
+        while g > 1 and c % g != 0:
+            g -= 1
+        return nn.GroupNorm(num_groups=g, num_channels=c)
+    raise ValueError(f"unknown norm kind: {kind!r} (expected 'bn' or 'gn')")
+
+
+class _DWSepConv(nn.Module):
+    """Depthwise 3×3 + norm + ReLU + pointwise 1×1 + norm + ReLU."""
+
+    def __init__(self, c_in: int, c_out: int, stride: int = 1,
+                 norm: str = "gn", gn_groups: int = 8):
         super().__init__()
         self.dw = nn.Conv2d(c_in, c_in, kernel_size=3, stride=stride,
                             padding=1, groups=c_in, bias=False)
-        self.bn1 = nn.BatchNorm2d(c_in)
+        self.n1 = _make_norm(c_in, norm, gn_groups)
         self.pw = nn.Conv2d(c_in, c_out, kernel_size=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(c_out)
+        self.n2 = _make_norm(c_out, norm, gn_groups)
         self.act = nn.ReLU(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.act(self.bn1(self.dw(x)))
-        x = self.act(self.bn2(self.pw(x)))
+        x = self.act(self.n1(self.dw(x)))
+        x = self.act(self.n2(self.pw(x)))
         return x
 
 
 class _EncoderStage(nn.Module):
     """Optional stride-2 downsample, then a second DW-sep refinement."""
 
-    def __init__(self, c_in: int, c_out: int, downsample: bool):
+    def __init__(self, c_in: int, c_out: int, downsample: bool,
+                 norm: str = "gn", gn_groups: int = 8):
         super().__init__()
         first_stride = 2 if downsample else 1
         self.body = nn.Sequential(
-            _DWSepConv(c_in, c_out, stride=first_stride),
-            _DWSepConv(c_out, c_out, stride=1),
+            _DWSepConv(c_in, c_out, stride=first_stride,
+                       norm=norm, gn_groups=gn_groups),
+            _DWSepConv(c_out, c_out, stride=1,
+                       norm=norm, gn_groups=gn_groups),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -60,11 +81,14 @@ class _EncoderStage(nn.Module):
 class _DecoderStage(nn.Module):
     """Bilinear upsample + skip concat + two DW-sep refinement convs."""
 
-    def __init__(self, c_in: int, c_skip: int, c_out: int):
+    def __init__(self, c_in: int, c_skip: int, c_out: int,
+                 norm: str = "gn", gn_groups: int = 8):
         super().__init__()
         self.body = nn.Sequential(
-            _DWSepConv(c_in + c_skip, c_out, stride=1),
-            _DWSepConv(c_out, c_out, stride=1),
+            _DWSepConv(c_in + c_skip, c_out, stride=1,
+                       norm=norm, gn_groups=gn_groups),
+            _DWSepConv(c_out, c_out, stride=1,
+                       norm=norm, gn_groups=gn_groups),
         )
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
@@ -87,6 +111,14 @@ class EventUnet(nn.Module):
         ``[32, 64, 96, 128]`` follows the plan.
     num_classes
         Output channels of the segmentation head. ``1`` for binary hand+arm.
+    norm
+        ``"gn"`` (default) for GroupNorm or ``"bn"`` for BatchNorm. GroupNorm
+        is preferred under the subject-disjoint LOSO split because it has no
+        running statistics — the held-out subject's voxel distribution is
+        normalized using the current batch only, not training-subject means.
+    gn_groups
+        Target number of GroupNorm groups (clamped down to the largest divisor
+        of ``c`` that does not exceed this value). Ignored when ``norm == "bn"``.
     """
 
     def __init__(
@@ -94,6 +126,8 @@ class EventUnet(nn.Module):
         in_channels: int = 5,
         encoder_channels: Sequence[int] = (32, 64, 96, 128),
         num_classes: int = 1,
+        norm: str = "gn",
+        gn_groups: int = 8,
     ):
         super().__init__()
         if len(encoder_channels) < 2:
@@ -104,7 +138,7 @@ class EventUnet(nn.Module):
         # Stem: full-resolution 3x3 expansion before any downsampling.
         self.stem = nn.Sequential(
             nn.Conv2d(in_channels, stem_ch, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(stem_ch),
+            _make_norm(stem_ch, norm, gn_groups),
             nn.ReLU(inplace=True),
         )
 
@@ -113,9 +147,11 @@ class EventUnet(nn.Module):
         # downsamplers. We keep `enc[0]` as a single full-res refinement so the
         # encoder skip set is symmetric with the decoder.
         self.encoder = nn.ModuleList()
-        self.encoder.append(_EncoderStage(stem_ch, ch[0], downsample=False))
+        self.encoder.append(_EncoderStage(stem_ch, ch[0], downsample=False,
+                                          norm=norm, gn_groups=gn_groups))
         for i in range(1, len(ch)):
-            self.encoder.append(_EncoderStage(ch[i - 1], ch[i], downsample=True))
+            self.encoder.append(_EncoderStage(ch[i - 1], ch[i], downsample=True,
+                                              norm=norm, gn_groups=gn_groups))
 
         # Decoder: walk back up, consuming skips in reverse. Each stage takes
         # ch[i] channels in (bottleneck for the first stage, prev decoder's
@@ -124,7 +160,8 @@ class EventUnet(nn.Module):
         self.decoder = nn.ModuleList()
         for i in range(len(ch) - 1, 0, -1):
             self.decoder.append(
-                _DecoderStage(c_in=ch[i], c_skip=ch[i - 1], c_out=ch[i - 1])
+                _DecoderStage(c_in=ch[i], c_skip=ch[i - 1], c_out=ch[i - 1],
+                              norm=norm, gn_groups=gn_groups)
             )
 
         self.head = nn.Conv2d(ch[0], num_classes, kernel_size=1)

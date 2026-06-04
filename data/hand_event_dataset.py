@@ -24,9 +24,10 @@ subject for `validation` and `test`, the rest for `train`.
 from __future__ import annotations
 
 import json
+import random
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -43,6 +44,55 @@ def _parse_subject(seq_name: str) -> str:
     if not m:
         raise ValueError(f"Cannot parse subject from sequence name: {seq_name}")
     return m.group(1)
+
+
+def _augment_pair(
+    voxel: torch.Tensor,
+    mask: torch.Tensor,
+    cfg: Dict[str, Any],
+    rng: random.Random,
+    rgb: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Apply geometric augmentation jointly to voxel + mask (+ optional RGB).
+
+    Voxel is resampled bilinearly (its signed polarity counts vary continuously);
+    mask is resampled nearest-neighbour to stay binary; RGB (if present) is
+    resampled bilinearly. All three share the same sampled transform parameters
+    so the event input, the supervision, and the teacher input stay aligned.
+    """
+    from torchvision.transforms.v2 import functional as TF
+    from torchvision.transforms.v2 import InterpolationMode
+
+    if rng.random() < float(cfg.get("hflip_prob", 0.0)):
+        voxel = TF.hflip(voxel)
+        mask = TF.hflip(mask)
+        if rgb is not None:
+            rgb = TF.hflip(rgb)
+
+    if rng.random() < float(cfg.get("affine_prob", 0.0)):
+        rot_deg = float(cfg.get("rotate_deg", 0.0))
+        scale_lo, scale_hi = cfg.get("scale_range", [1.0, 1.0])
+        trans_frac = float(cfg.get("translate_frac", 0.0))
+        h, w = int(mask.shape[-2]), int(mask.shape[-1])
+        angle = rng.uniform(-rot_deg, rot_deg)
+        scale = rng.uniform(float(scale_lo), float(scale_hi))
+        tx = rng.uniform(-trans_frac, trans_frac) * w
+        ty = rng.uniform(-trans_frac, trans_frac) * h
+        voxel = TF.affine(
+            voxel, angle=angle, translate=[tx, ty], scale=scale, shear=[0.0, 0.0],
+            interpolation=InterpolationMode.BILINEAR, fill=0.0,
+        )
+        mask = TF.affine(
+            mask.unsqueeze(0), angle=angle, translate=[tx, ty], scale=scale,
+            shear=[0.0, 0.0], interpolation=InterpolationMode.NEAREST, fill=0.0,
+        ).squeeze(0)
+        if rgb is not None:
+            rgb = TF.affine(
+                rgb, angle=angle, translate=[tx, ty], scale=scale, shear=[0.0, 0.0],
+                interpolation=InterpolationMode.BILINEAR, fill=0.0,
+            )
+
+    return voxel, mask, rgb
 
 
 class HandEventDataset(data.Dataset):
@@ -76,6 +126,27 @@ class HandEventDataset(data.Dataset):
         If set, look up teacher masks at <mask_root>/<sequence_name>/{i:06d}.png
         instead of <sequence>/proc/teacher_masks/. Use this when the dataset
         filesystem is read-only and masks live in scratch space.
+    augmentation : Optional[Dict[str, Any]]
+        Geometric augmentation config applied only when ``purpose == "train"``.
+        Recognized keys (with defaults shown):
+
+            enabled:        False
+            hflip_prob:     0.0     # horizontal flip probability
+            affine_prob:    0.0     # affine application probability
+            rotate_deg:     0.0     # max |rotation| in degrees, sampled uniformly
+            scale_range:    [1.0, 1.0]
+            translate_frac: 0.0     # max |translation| as fraction of (H, W)
+
+        Voxel resampling is bilinear, mask resampling is nearest-neighbour, so
+        the binary supervision stays exact. Disabled (no-op) on val and test.
+        RGB (if loaded) shares the same transform via bilinear interpolation.
+    provide_rgb : bool
+        If True, also load the paired FLIR PNG at ``proc/flir/frame/{i:06d}.png``
+        and return it as a ``(3, H, W)`` float tensor in ``[0, 1]``. Used by
+        the online feature-distillation path that runs SAM 2's image encoder on
+        the RGB stream to align student event-domain features with the teacher.
+        The sample becomes a 4-tuple ``(voxel, mask, rgb, meta)``; default 3-tuple
+        contract is preserved when False.
     """
 
     POLARITY_MODE = "signed"  # voxel grid in [-1, 1] sense
@@ -92,6 +163,8 @@ class HandEventDataset(data.Dataset):
         require_teacher: bool = True,
         action_only: bool = False,
         mask_root: Optional[str] = None,
+        augmentation: Optional[Dict[str, Any]] = None,
+        provide_rgb: bool = False,
     ):
         super().__init__()
         self.root = Path(root_dir)
@@ -105,6 +178,19 @@ class HandEventDataset(data.Dataset):
         self.require_teacher = require_teacher
         self.action_only = action_only
         self.mask_root = Path(mask_root) if mask_root else None
+
+        # Augmentation only active on train; converted to a plain dict (the YAML
+        # path may deliver an OmegaConf node, which doesn't accept .get cleanly
+        # from worker processes).
+        if augmentation is None:
+            self.augmentation: Dict[str, Any] = {"enabled": False}
+        else:
+            self.augmentation = dict(augmentation)
+        self._aug_active = (
+            self.purpose == "train"
+            and bool(self.augmentation.get("enabled", False))
+        )
+        self.provide_rgb = bool(provide_rgb)
 
         all_sequences = sorted(
             p for p in self.root.iterdir()
@@ -271,10 +357,33 @@ class HandEventDataset(data.Dataset):
         else:
             mask = torch.zeros((self.image_height, self.image_width), dtype=torch.float32)
 
+        rgb: Optional[torch.Tensor] = None
+        if self.provide_rgb:
+            rgb_path = seq_dir / "proc" / "flir" / "frame" / f"{f_idx:06d}.png"
+            rgb_img = cv2.imread(str(rgb_path), cv2.IMREAD_COLOR)
+            if rgb_img is None:
+                raise IOError(f"Could not read RGB frame {rgb_path}")
+            rgb_img = cv2.cvtColor(rgb_img, cv2.COLOR_BGR2RGB)
+            if rgb_img.shape[:2] != (self.image_height, self.image_width):
+                rgb_img = cv2.resize(
+                    rgb_img, (self.image_width, self.image_height),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+            rgb = torch.from_numpy(rgb_img).permute(2, 0, 1).contiguous().float() / 255.0
+
+        if self._aug_active:
+            # Per-sample RNG derived from idx + python's global seed (set per
+            # worker by Lightning's seed_everything). Avoids cross-worker
+            # correlation while staying reproducible at a fixed global seed.
+            rng = random.Random((idx * 2654435761) ^ random.getrandbits(32))
+            voxel, mask, rgb = _augment_pair(voxel, mask, self.augmentation, rng, rgb=rgb)
+
         meta = {
             "sequence": seq_dir.name,
             "frame_index": f_idx,
             "t_center": t_center,
             "n_events": hi - lo,
         }
+        if self.provide_rgb:
+            return voxel, mask, rgb, meta
         return voxel, mask, meta
