@@ -30,6 +30,8 @@ DATA:
       require_teacher: True         # set False before running sam2_pseudo_labels.py
       action_only: False
       mask_root: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNewTeacherMasks   # complete SAM 2 teacher masks
+      # Phase B supervises on the cached mask only — no online RGB teacher.
+      provide_rgb: False
       # Carry through fields used by the placeholder MODEL section below.
       num_classes: 1
       # Train-only spatial augmentation. Off for val/test regardless. Combats
@@ -59,9 +61,10 @@ MODEL:
   class_name: EventUnet
   model_init_args:
     in_channels: 5                  # = voxel_bins
-    # 0.4M params at this width; landing in the plan's 0.4–0.8M target band.
-    # Drop to [32, 64, 96, 128] for a ~118K-param ablation variant.
-    encoder_channels: [64, 128, 192, 256]
+    # ~0.65M params at this width (residual DW-sep + SE + global-context
+    # bottleneck), landing in the plan's 0.4–0.8M target band. Bump to
+    # [64, 128, 192, 256] (~1.4M) only if mask quality is capacity-limited.
+    encoder_channels: [48, 96, 128, 160]
     num_classes: 1
     # GroupNorm preferred over BatchNorm for LOSO: no running statistics, so
     # the held-out subject's voxel distribution isn't normalized by training-
@@ -70,6 +73,13 @@ MODEL:
     # width automatically.
     norm: gn
     gn_groups: 8
+    # Squeeze-excitation channel gating inside every residual block.
+    use_se: True
+    # ASPP-lite global-context bottleneck — the main driver of long-range mask
+    # transfer from SAM 2. Set False (with use_se False) for the ~0.4M
+    # purely-local ablation variant.
+    use_context: True
+    context_dilations: [1, 2, 4]
 
 OPTIMIZER:
   name: AdamW
