@@ -21,18 +21,39 @@ def _to_pred_mask(logits: torch.Tensor, threshold: float) -> torch.Tensor:
     return (torch.sigmoid(logits) > threshold).float()
 
 
+def _foreground_mask(target: torch.Tensor) -> torch.Tensor:
+    """Per-sample boolean: True where the GT mask has any foreground pixel."""
+    return target.sum(dim=(-2, -1)) > 0
+
+
 def binary_iou(
     logits: torch.Tensor,
     target: torch.Tensor,
     threshold: float = 0.5,
     eps: float = 1e-6,
+    ignore_empty: bool = True,
 ) -> torch.Tensor:
-    """Mean per-sample binary IoU. Returns a 0-d tensor."""
+    """Mean per-sample binary IoU. Returns a 0-d tensor.
+
+    With ``ignore_empty=True`` (default), frames whose GT mask is all-zero
+    (hand/arm absent) are dropped from the mean. Without this, an empty-GT +
+    empty-pred frame scores a perfect ``1.0`` (``(0+eps)/(0+eps)``) and inflates
+    the metric — a problem here because ``val_iou_epoch`` drives checkpoint
+    selection. The exclusion is per-sample, so a mixed batch still scores its
+    hand-present frames. If a batch happens to contain *only* empty-GT frames
+    we fall back to the all-frame mean (a finite, correctness-conditioned value)
+    rather than returning NaN, which keeps DDP epoch-aggregation well-defined.
+    """
     pred = _to_pred_mask(logits, threshold)
     target = target.float()
     inter = (pred * target).sum(dim=(-2, -1))
     union = (pred + target - pred * target).sum(dim=(-2, -1))
-    return ((inter + eps) / (union + eps)).mean()
+    iou = (inter + eps) / (union + eps)
+    if ignore_empty:
+        valid = _foreground_mask(target)
+        if valid.any():
+            return iou[valid].mean()
+    return iou.mean()
 
 
 def binary_dice(
@@ -40,13 +61,24 @@ def binary_dice(
     target: torch.Tensor,
     threshold: float = 0.5,
     eps: float = 1e-6,
+    ignore_empty: bool = True,
 ) -> torch.Tensor:
-    """Mean per-sample Dice coefficient. Useful as a complementary metric to IoU."""
+    """Mean per-sample Dice coefficient. Useful as a complementary metric to IoU.
+
+    ``ignore_empty`` behaves exactly as in :func:`binary_iou` — empty-GT frames
+    are excluded from the mean to avoid the ``1.0`` self-inflation, with an
+    all-frame fallback for a fully-empty batch.
+    """
     pred = _to_pred_mask(logits, threshold)
     target = target.float()
     inter = (pred * target).sum(dim=(-2, -1))
     denom = pred.sum(dim=(-2, -1)) + target.sum(dim=(-2, -1))
-    return ((2 * inter + eps) / (denom + eps)).mean()
+    dice = (2 * inter + eps) / (denom + eps)
+    if ignore_empty:
+        valid = _foreground_mask(target)
+        if valid.any():
+            return dice[valid].mean()
+    return dice.mean()
 
 
 def _boundary(mask: torch.Tensor) -> torch.Tensor:
@@ -73,6 +105,7 @@ def boundary_f_score(
     d_tolerance: int = 2,
     threshold: float = 0.5,
     eps: float = 1e-6,
+    ignore_empty: bool = True,
 ) -> torch.Tensor:
     """Boundary F-score with a ``d_tolerance``-pixel match radius.
 
@@ -80,6 +113,10 @@ def boundary_f_score(
     counts as a hit if any GT boundary pixel lies within ``d_tolerance`` pixels
     (and symmetrically for recall). Returns a 0-d tensor — the mean F across
     the batch.
+
+    ``ignore_empty=True`` (default) drops empty-GT frames from the mean, matching
+    :func:`binary_iou` / :func:`binary_dice`, with an all-frame fallback for a
+    fully-empty batch.
     """
     pred = _to_pred_mask(logits, threshold)
     target = target.float()
@@ -96,8 +133,17 @@ def boundary_f_score(
     precision = tp_precision / (n_pred + eps)
     recall = tp_recall / (n_gt + eps)
     f = 2 * precision * recall / (precision + recall + eps)
-    # Frames with no GT boundary AND no pred boundary → perfect score (1.0);
-    # frames with one but not the other → 0.0. (precision/recall already encode this.)
+    # A frame with neither a predicted nor a GT boundary is a perfect match
+    # (the model correctly produced nothing): force F = 1.0. The raw formula
+    # yields 0.0 there (both precision and recall are 0/eps), which is wrong —
+    # this is the bug the comment used to claim was already handled.
+    both_empty = (n_pred == 0) & (n_gt == 0)
+    f = torch.where(both_empty, torch.ones_like(f), f)
+
+    if ignore_empty:
+        valid = _foreground_mask(target)
+        if valid.any():
+            return f[valid].mean()
     return f.mean()
 
 

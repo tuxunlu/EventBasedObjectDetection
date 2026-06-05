@@ -71,6 +71,9 @@ class ModelInterface(pl.LightningModule):
         # ``_feature_distillation_step`` because Lightning's ``setup()`` runs
         # before the strategy has finished placing the model on its device.
         self._teacher_holder = []
+        # Random-but-stable held-out sequence ids for validation preview videos,
+        # chosen lazily on the first validation epoch (see _save_validation_previews).
+        self._preview_seq_ids = None
         self.feature_distill_loss = None
         if self.task == "segmentation":
             teacher_cfg = getattr(training_cfg, "teacher_config", None)
@@ -85,8 +88,14 @@ class ModelInterface(pl.LightningModule):
                 # The cached-mask DistillationLoss is unused on this path.
                 self.seg_loss = None
             else:
-                # Phase B path: BCE + Dice only on cached SAM 2 masks.
-                self.seg_loss = DistillationLoss(bce_weight=1.0, dice_weight=1.0)
+                # Phase B path: BCE + Dice only on cached SAM 2 masks. The
+                # optional pos_weight upweights the (small) foreground class to
+                # counter the heavy background bias amplified by all-empty frames.
+                pos_weight = getattr(training_cfg, "seg_pos_weight", None)
+                self.seg_loss = DistillationLoss(
+                    bce_weight=1.0, dice_weight=1.0,
+                    pos_weight=float(pos_weight) if pos_weight is not None else None,
+                )
             self.loss_function = None  # not used in segmentation path
         else:
             self.loss_function = self.__configure_loss()
@@ -125,6 +134,119 @@ class ModelInterface(pl.LightningModule):
     # Epoch level training logging
     def on_train_epoch_end(self):
         pass
+
+    def on_validation_epoch_end(self):
+        """Render a couple of held-out preview videos (segmentation only).
+
+        Rank-0 only, skipped during the sanity-check pass. Visualization must
+        never take training down, so any failure is caught and logged.
+        """
+        if self.task != "segmentation":
+            return
+        n = int(getattr(self.training_cfg, "val_preview_count", 0) or 0)
+        if n <= 0:
+            return
+        if not getattr(self.trainer, "is_global_zero", True):
+            return
+        if getattr(self.trainer, "sanity_checking", False):
+            return
+        try:
+            self._save_validation_previews(n)
+        except Exception as exc:  # noqa: BLE001 - never crash training on viz
+            print(f"[viz] validation preview skipped ({type(exc).__name__}: {exc})")
+
+    @torch.no_grad()
+    def _save_validation_previews(self, n: int):
+        """Run the student over ``n`` random held-out sequences → 3-panel MP4s.
+
+        Panels are Events | Teacher (GT) Mask | Student Prediction, matching the
+        offline teacher preview in ``data/sam2_pseudo_labels.py``. The sequences
+        are picked once (seeded by the run seed) and cached so the same clips
+        are re-rendered each epoch, letting you watch them sharpen over training.
+        Long clips are strided down to a frame cap so a preview stays cheap.
+        """
+        from pathlib import Path
+        from math import ceil
+
+        from utils.metrics.segmentation import binary_iou
+        from utils.viz.val_preview import (
+            events_panel_from_voxel, infer_fps, write_triptych_video,
+        )
+
+        MAX_FRAMES = 600
+
+        dm = getattr(self.trainer, "datamodule", None)
+        val_set = getattr(dm, "validation_set", None) if dm is not None else None
+        if val_set is None or not hasattr(val_set, "sequences") \
+                or not hasattr(val_set, "index"):
+            print("[viz] validation set has no sequence index; skipping previews")
+            return
+
+        # Pick the preview sequences once, deterministically, and reuse them.
+        if self._preview_seq_ids is None:
+            import random as _random
+            rng = _random.Random(int(getattr(self.training_cfg, "seed", 0)))
+            ids = list(range(len(val_set.sequences)))
+            rng.shuffle(ids)
+            self._preview_seq_ids = ids[:n]
+
+        out_dir = Path(self.trainer.log_dir or ".") / "val_previews"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            for s_idx in self._preview_seq_ids:
+                # Dataset positions whose sample belongs to this sequence, in
+                # frame order (val_set.index is built in (seq, frame) order).
+                positions = [i for i, (si, _f) in enumerate(val_set.index)
+                             if si == s_idx]
+                if not positions:
+                    continue
+                if len(positions) > MAX_FRAMES:
+                    stride = ceil(len(positions) / MAX_FRAMES)
+                    positions = positions[::stride]
+
+                event_panels, gt_masks, pred_masks, ious = [], [], [], []
+                for pos in positions:
+                    sample = val_set[pos]
+                    voxel, mask = sample[0], sample[1]  # (B,H,W), (H,W)
+                    logits = self.model(voxel.unsqueeze(0).to(self.device))
+                    prob = torch.sigmoid(logits)[0, 0]
+                    pred = (prob > 0.5).float()
+
+                    event_panels.append(events_panel_from_voxel(voxel))
+                    gt_np = (mask.detach().cpu().numpy() * 255).astype("uint8")
+                    gt_masks.append(gt_np)
+                    pred_masks.append((pred.cpu().numpy() * 255).astype("uint8"))
+                    # Per-frame IoU only meaningful where the GT has foreground.
+                    if float(mask.sum()) > 0:
+                        ious.append(float(binary_iou(
+                            logits.detach(), mask.unsqueeze(0).to(self.device))))
+                    else:
+                        ious.append(None)
+
+                seq_name = val_set.sequences[s_idx].name
+                fps = self._infer_preview_fps(val_set, s_idx, infer_fps)
+                out_path = out_dir / f"epoch{self.current_epoch:03d}_{seq_name}.mp4"
+                write_triptych_video(
+                    event_panels, gt_masks, pred_masks, out_path,
+                    fps=fps, title=seq_name, per_frame_iou=ious,
+                )
+                print(f"[viz] wrote {out_path} ({len(positions)} frames, "
+                      f"{fps:.1f} fps)")
+        finally:
+            if was_training:
+                self.model.train()
+
+    @staticmethod
+    def _infer_preview_fps(val_set, s_idx, infer_fps):
+        """Best-effort fps from the sequence's FLIR timestamps; 30 on failure."""
+        try:
+            handle = val_set._get_handle(val_set.sequences[s_idx])
+            return infer_fps(handle.get("flir_t"))
+        except Exception:  # noqa: BLE001
+            return 30.0
 
     # Caution: self.model.train() is invoked
     # For logging, check document: https://lightning.ai/docs/pytorch/stable/extensions/logging.html#automatic-logging

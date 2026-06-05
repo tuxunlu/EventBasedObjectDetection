@@ -9,6 +9,10 @@ TRAINING:
   seed: 42
   max_epochs: 50
   task: segmentation
+  # BCE positive-class weight for the cached-mask Phase-B loss. null = off.
+  # Raise to ~5-20 if val_iou stalls because the model collapses to all-zero
+  # masks under the heavy background bias (made worse by all-empty frames).
+  seg_pos_weight: null
 
 DISTRIBUTED:
   accelerator: gpu

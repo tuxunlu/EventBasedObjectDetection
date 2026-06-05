@@ -29,3 +29,17 @@ class TrainingConfig(TrackedConfigMixin):
     #                  e.g. {"low": 0.5, "mid": 1.0, "high": 1.0}
     #   mask_weight: scalar weight on the BCE+Dice term (default 1.0)
     teacher_config: Optional[Dict[str, Any]] = None
+    # Phase-B (cached-mask-only) BCE positive-class weight, passed to
+    # DistillationLoss(pos_weight=...). Hand/arm masks cover a small fraction of
+    # each frame, and all-empty frames worsen the imbalance, so unweighted BCE
+    # can collapse toward predicting all-zero. A value of ~5-20 upweights the
+    # positive (foreground) class. None (default) disables the reweighting.
+    # Ignored when teacher_config is set (the feature-distillation path has its
+    # own loss).
+    seg_pos_weight: Optional[float] = None
+    # Number of random held-out sequences to render as Events|GT|Prediction
+    # preview MP4s at the end of every validation epoch (segmentation task
+    # only). 0 disables. The chosen sequences are fixed across epochs so the
+    # same clips can be watched improving; files land under
+    # <log_dir>/val_previews/epoch{NNN}_<sequence>.mp4.
+    val_preview_count: int = 2
