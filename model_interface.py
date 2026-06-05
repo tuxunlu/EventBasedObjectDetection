@@ -54,20 +54,35 @@ class ModelInterface(pl.LightningModule):
         )
 
         self.model = self.__load_model()
-        self.teacher = None
+        # The frozen teacher is held in a plain Python list — NOT assigned as a
+        # bare ``nn.Module`` attribute. Reason: ``nn.Module.__setattr__`` would
+        # otherwise register it as a child, which would:
+        #   1. serialize all ~200M teacher params into every Lightning checkpoint
+        #      (with save_top_k + save_last that's ~1.6 GB of redundant SAM 2
+        #      weights per run);
+        #   2. require ``sam2`` importable with matching key layout on every
+        #      ``load_from_checkpoint`` call, including for inference-only use;
+        #   3. show up under ``self.parameters()`` if a future contributor
+        #      accidentally swaps ``self.model.parameters()`` for ``self.parameters()``
+        #      in ``configure_optimizers`` (the frozen teacher would then
+        #      receive an optimizer entry, harmless but wasteful).
+        # The list wrapping sidesteps all three. ``self.teacher`` is exposed
+        # as a property; device movement happens lazily in
+        # ``_feature_distillation_step`` because Lightning's ``setup()`` runs
+        # before the strategy has finished placing the model on its device.
+        self._teacher_holder = []
         self.feature_distill_loss = None
         if self.task == "segmentation":
             teacher_cfg = getattr(training_cfg, "teacher_config", None)
             if teacher_cfg:
-                self.teacher = self.__build_teacher(teacher_cfg)
+                self._teacher_holder.append(self.__build_teacher(teacher_cfg))
                 self.feature_distill_loss = FeatureDistillationLoss(
                     mask_weight=float(teacher_cfg.get("mask_weight", 1.0)),
                     align_weights=dict(teacher_cfg.get("align_weights", {
                         "low": 0.5, "mid": 1.0, "high": 1.0,
                     })),
                 )
-                # The cached-mask DistillationLoss is unused on this path; keep
-                # the attribute set to None so __getstate__ stays simple.
+                # The cached-mask DistillationLoss is unused on this path.
                 self.seg_loss = None
             else:
                 # Phase B path: BCE + Dice only on cached SAM 2 masks.
@@ -75,6 +90,32 @@ class ModelInterface(pl.LightningModule):
             self.loss_function = None  # not used in segmentation path
         else:
             self.loss_function = self.__configure_loss()
+
+    @property
+    def teacher(self):
+        return self._teacher_holder[0] if self._teacher_holder else None
+
+    def _ensure_teacher_on_device(self, ref: torch.Tensor):
+        """Lazily move the teacher onto the same device as ``ref``.
+
+        Called from the feature-distillation step instead of relying on
+        ``setup()`` — Lightning's lifecycle places the model on its strategy
+        device *after* ``setup()`` finishes, so ``self.device`` may still be
+        ``cpu`` at the point ``setup()`` runs. Doing the move here is
+        bulletproof and the conditional is a single tensor-device compare per
+        step (zero-cost after the first call).
+        """
+        teacher = self.teacher
+        if teacher is None:
+            return None
+        try:
+            t_dev = next(teacher.parameters()).device
+        except StopIteration:
+            return teacher
+        if t_dev != ref.device:
+            self._teacher_holder[0] = teacher.to(ref.device)
+            teacher = self._teacher_holder[0]
+        return teacher
 
     def forward(self, x):
         return self.model(x)
@@ -192,8 +233,10 @@ class ModelInterface(pl.LightningModule):
         logits, student_feats = self.model.forward_with_features(voxel)
 
         # Teacher: frozen, no grad, no autocast (let SAM 2 use its own dtype).
+        # Lazy device move on first call — see _ensure_teacher_on_device for why.
+        teacher = self._ensure_teacher_on_device(rgb)
         with torch.no_grad():
-            teacher_feats = self.teacher(rgb)
+            teacher_feats = teacher(rgb)
 
         terms = self.feature_distill_loss(
             mask_logits=logits,
