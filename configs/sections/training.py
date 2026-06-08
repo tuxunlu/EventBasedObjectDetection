@@ -13,7 +13,9 @@ class TrainingConfig(TrackedConfigMixin):
     max_epochs: int = 1
     # Task selector consumed by ModelInterface. "classification" preserves the
     # original Cifar template flow; "segmentation" switches to a 3-tuple
-    # (voxel, mask, meta) batch contract with BCE+Dice supervision.
+    # (voxel, mask, meta) batch contract with BCE+Dice supervision; "tracking"
+    # switches to a temporal clip contract (voxel(N,T,C,H,W), mask(N,T,H,W),
+    # meta) with a recurrent-memory model (EventTrackUnet) and HandEventClipDataset.
     task: str = "classification"
     # Optional online teacher for the segmentation task. When set, the
     # ModelInterface loads the teacher in __init__, switches to the 4-tuple
@@ -43,3 +45,10 @@ class TrainingConfig(TrackedConfigMixin):
     # same clips can be watched improving; files land under
     # <log_dir>/val_previews/epoch{NNN}_<sequence>.mp4.
     val_preview_count: int = 2
+    # Tracking task only: weight on the static-region temporal-consistency
+    # (anti-flicker) penalty added in ModelInterface._tracking_step. It penalizes
+    # change in predicted probability across consecutive clip frames at pixels
+    # with no events (which should stay put), directly targeting mask jitter on
+    # momentarily-still regions. 0.0 disables; ~0.25-1.0 is a sane range. Has no
+    # effect on the classification/segmentation tasks.
+    temporal_consistency_weight: float = 0.0

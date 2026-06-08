@@ -13,6 +13,7 @@ TRAINING:
   # Raise to ~5-20 if val_iou stalls because the model collapses to all-zero
   # masks under the heavy background bias (made worse by all-empty frames).
   seg_pos_weight: null
+  val_preview_count: 4
 
 DISTRIBUTED:
   accelerator: gpu
@@ -28,11 +29,11 @@ DATA:
       root_dir: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNew
       voxel_bins: 5
       window_ms: 36.0
-      image_height: 480
-      image_width: 640
+      image_height: 240
+      image_width: 320
       held_out_subject: tuxun       # LOSO held-out subject for val/test
       require_teacher: True         # set False before running sam2_pseudo_labels.py
-      action_only: False
+      action_only: True
       mask_root: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNewTeacherMasks   # complete SAM 2 teacher masks
       # Phase B supervises on the cached mask only — no online RGB teacher.
       provide_rgb: False
@@ -49,8 +50,8 @@ DATA:
         scale_range: [0.9, 1.1]
         translate_frac: 0.05
   dataloader:
-    batch_size: 4
-    test_batch_size: 4
+    batch_size: 16
+    test_batch_size: 8
     num_workers: 8
     persistent_workers: True
     pin_memory: True

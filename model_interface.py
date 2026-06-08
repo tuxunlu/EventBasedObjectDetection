@@ -9,7 +9,9 @@ from loss.loss_funcs import cross_entropy_loss
 from loss.distillation import DistillationLoss
 from loss.feature_distillation import FeatureDistillationLoss
 from torchmetrics.functional.classification import multiclass_accuracy
-from utils.metrics.segmentation import binary_iou, binary_dice, boundary_f_score
+from utils.metrics.segmentation import (
+    binary_iou, binary_dice, boundary_f_score,
+)
 from configs.sections import (
     ModelConfig,
     OptimizerConfig,
@@ -20,7 +22,7 @@ from configs.sections import (
 
 
 class ModelInterface(pl.LightningModule):
-    SUPPORTED_TASKS = ("classification", "segmentation")
+    SUPPORTED_TASKS = ("classification", "segmentation", "tracking")
 
     def __init__(
         self,
@@ -74,9 +76,18 @@ class ModelInterface(pl.LightningModule):
         # Random-but-stable held-out sequence ids for validation preview videos,
         # chosen lazily on the first validation epoch (see _save_validation_previews).
         self._preview_seq_ids = None
+        # Static-region temporal-consistency weight (tracking task only): an
+        # anti-flicker penalty on prediction changes across consecutive frames
+        # in pixels with no events. 0 disables. See _tracking_step.
+        self.temporal_consistency_weight = float(
+            getattr(training_cfg, "temporal_consistency_weight", 0.0) or 0.0
+        )
         self.feature_distill_loss = None
-        if self.task == "segmentation":
-            teacher_cfg = getattr(training_cfg, "teacher_config", None)
+        if self.task in ("segmentation", "tracking"):
+            # The tracking task is Phase-B (cached-mask BCE+Dice) only; the
+            # online feature-distillation teacher is a segmentation-only path.
+            teacher_cfg = (getattr(training_cfg, "teacher_config", None)
+                           if self.task == "segmentation" else None)
             if teacher_cfg:
                 self._teacher_holder.append(self.__build_teacher(teacher_cfg))
                 self.feature_distill_loss = FeatureDistillationLoss(
@@ -136,17 +147,29 @@ class ModelInterface(pl.LightningModule):
         pass
 
     def on_validation_epoch_end(self):
-        """Render a couple of held-out preview videos (segmentation only).
+        """Render one held-out preview video per rank (segmentation/tracking).
 
-        Rank-0 only, skipped during the sanity-check pass. Visualization must
-        never take training down, so any failure is caught and logged.
+        Every DDP rank renders exactly one sequence, so the visualization work
+        is symmetric across the process group: no rank sits idle and races ahead
+        to the next collective (metric all-reduce / ModelCheckpoint) while
+        another is still encoding. That symmetry — not a barrier — is what keeps
+        the ranks in lockstep, which is why no explicit barrier is needed here.
+        The earlier rank-0-only version deadlocked precisely because the work
+        was asymmetric: ranks 1..N-1 reached the next collective and blocked
+        waiting for rank 0, which was still encoding videos.
+
+        For the tracking task the model is run *statefully* across the whole
+        sequence (memory + prev-mask carried frame to frame), so the preview
+        shows the actual temporal behavior — i.e. whether the jitter is gone.
+
+        Skipped during the sanity-check pass. Visualization must never take
+        training down, so any failure is caught and logged; a rank that fails
+        just renders nothing and still meets the others at the next collective.
         """
-        if self.task != "segmentation":
+        if self.task not in ("segmentation", "tracking"):
             return
         n = int(getattr(self.training_cfg, "val_preview_count", 0) or 0)
         if n <= 0:
-            return
-        if not getattr(self.trainer, "is_global_zero", True):
             return
         if getattr(self.trainer, "sanity_checking", False):
             return
@@ -157,13 +180,16 @@ class ModelInterface(pl.LightningModule):
 
     @torch.no_grad()
     def _save_validation_previews(self, n: int):
-        """Run the student over ``n`` random held-out sequences → 3-panel MP4s.
+        """Render this rank's single held-out preview sequence → a 3-panel MP4.
 
+        Each rank renders the sequence at its global-rank slot in a
+        deterministically shuffled list (so the same clip per rank re-renders
+        every epoch, letting you watch it sharpen). ``val_preview_count`` (``n``)
+        caps how many sequences are eligible across the group; with one video
+        per rank, at most ``min(n, world_size, num_val_sequences)`` are written.
         Panels are Events | Teacher (GT) Mask | Student Prediction, matching the
-        offline teacher preview in ``data/sam2_pseudo_labels.py``. The sequences
-        are picked once (seeded by the run seed) and cached so the same clips
-        are re-rendered each epoch, letting you watch them sharpen over training.
-        Long clips are strided down to a frame cap so a preview stays cheap.
+        offline teacher preview in ``data/sam2_pseudo_labels.py``. Long clips are
+        strided down to a frame cap so a preview stays cheap.
         """
         from pathlib import Path
         from math import ceil
@@ -182,59 +208,82 @@ class ModelInterface(pl.LightningModule):
             print("[viz] validation set has no sequence index; skipping previews")
             return
 
-        # Pick the preview sequences once, deterministically, and reuse them.
+        # Deterministic shuffle of all val sequences, chosen once and reused. The
+        # rng is seeded identically on every rank, so the ordering matches and
+        # each rank can pick its own slot without any cross-rank communication.
         if self._preview_seq_ids is None:
             import random as _random
             rng = _random.Random(int(getattr(self.training_cfg, "seed", 0)))
             ids = list(range(len(val_set.sequences)))
             rng.shuffle(ids)
-            self._preview_seq_ids = ids[:n]
+            self._preview_seq_ids = ids
+
+        # One video per rank: this rank renders the sequence at its rank slot,
+        # bounded by the configured preview count. Ranks beyond the available
+        # sequences (or the cap) render nothing and just proceed.
+        rank = int(getattr(self.trainer, "global_rank", 0) or 0)
+        eligible = self._preview_seq_ids[:n]
+        if rank >= len(eligible):
+            return
+        s_idx = eligible[rank]
+
+        # Dataset positions whose sample belongs to this sequence, in frame
+        # order (val_set.index is built in (seq, frame) order).
+        positions = [i for i, (si, _f) in enumerate(val_set.index) if si == s_idx]
+        if not positions:
+            return
+        if len(positions) > MAX_FRAMES:
+            stride = ceil(len(positions) / MAX_FRAMES)
+            positions = positions[::stride]
 
         out_dir = Path(self.trainer.log_dir or ".") / "val_previews"
         out_dir.mkdir(parents=True, exist_ok=True)
 
+        # Single-frame accessor: the clip dataset returns clips from __getitem__,
+        # so it exposes frame_sample() for one-frame access; the plain seg dataset
+        # returns single frames from __getitem__ directly.
+        frame_getter = getattr(val_set, "frame_sample", None) or val_set.__getitem__
+        # Tracking models expose step(frame, state) for stateful streaming; run
+        # the whole sequence through one carried state so the preview reflects
+        # the temporal memory (per-frame call for the stateless seg model).
+        streaming = hasattr(self.model, "step")
+
         was_training = self.model.training
         self.model.eval()
         try:
-            for s_idx in self._preview_seq_ids:
-                # Dataset positions whose sample belongs to this sequence, in
-                # frame order (val_set.index is built in (seq, frame) order).
-                positions = [i for i, (si, _f) in enumerate(val_set.index)
-                             if si == s_idx]
-                if not positions:
-                    continue
-                if len(positions) > MAX_FRAMES:
-                    stride = ceil(len(positions) / MAX_FRAMES)
-                    positions = positions[::stride]
+            event_panels, gt_masks, pred_masks, ious = [], [], [], []
+            state = None
+            for pos in positions:
+                sample = frame_getter(pos)
+                voxel, mask = sample[0], sample[1]  # (C,H,W), (H,W)
+                inp = voxel.unsqueeze(0).to(self.device)
+                if streaming:
+                    logits, state = self.model.step(inp, state)
+                else:
+                    logits = self.model(inp)
+                prob = torch.sigmoid(logits)[0, 0]
+                pred = (prob > 0.5).float()
 
-                event_panels, gt_masks, pred_masks, ious = [], [], [], []
-                for pos in positions:
-                    sample = val_set[pos]
-                    voxel, mask = sample[0], sample[1]  # (B,H,W), (H,W)
-                    logits = self.model(voxel.unsqueeze(0).to(self.device))
-                    prob = torch.sigmoid(logits)[0, 0]
-                    pred = (prob > 0.5).float()
+                event_panels.append(events_panel_from_voxel(voxel))
+                gt_np = (mask.detach().cpu().numpy() * 255).astype("uint8")
+                gt_masks.append(gt_np)
+                pred_masks.append((pred.cpu().numpy() * 255).astype("uint8"))
+                # Per-frame IoU only meaningful where the GT has foreground.
+                if float(mask.sum()) > 0:
+                    ious.append(float(binary_iou(
+                        logits.detach(), mask.unsqueeze(0).to(self.device))))
+                else:
+                    ious.append(None)
 
-                    event_panels.append(events_panel_from_voxel(voxel))
-                    gt_np = (mask.detach().cpu().numpy() * 255).astype("uint8")
-                    gt_masks.append(gt_np)
-                    pred_masks.append((pred.cpu().numpy() * 255).astype("uint8"))
-                    # Per-frame IoU only meaningful where the GT has foreground.
-                    if float(mask.sum()) > 0:
-                        ious.append(float(binary_iou(
-                            logits.detach(), mask.unsqueeze(0).to(self.device))))
-                    else:
-                        ious.append(None)
-
-                seq_name = val_set.sequences[s_idx].name
-                fps = self._infer_preview_fps(val_set, s_idx, infer_fps)
-                out_path = out_dir / f"epoch{self.current_epoch:03d}_{seq_name}.mp4"
-                write_triptych_video(
-                    event_panels, gt_masks, pred_masks, out_path,
-                    fps=fps, title=seq_name, per_frame_iou=ious,
-                )
-                print(f"[viz] wrote {out_path} ({len(positions)} frames, "
-                      f"{fps:.1f} fps)")
+            seq_name = val_set.sequences[s_idx].name
+            fps = self._infer_preview_fps(val_set, s_idx, infer_fps)
+            out_path = out_dir / f"epoch{self.current_epoch:03d}_{seq_name}.mp4"
+            write_triptych_video(
+                event_panels, gt_masks, pred_masks, out_path,
+                fps=fps, title=seq_name, per_frame_iou=ious,
+            )
+            print(f"[viz] rank{rank} wrote {out_path} ({len(positions)} frames, "
+                  f"{fps:.1f} fps)")
         finally:
             if was_training:
                 self.model.train()
@@ -256,6 +305,8 @@ class ModelInterface(pl.LightningModule):
     # 3. If sync_dist=True, logger will average metrics across devices. This introduces additional communication overhead, and not suggested for large metric tensors.
     # We can also define customized metrics aggregator for incremental step-level aggregation(to be merged into epoch-level metrics).
     def training_step(self, batch, batch_idx):
+        if self.task == "tracking":
+            return self._tracking_step(batch, "train")
         if self.task == "segmentation":
             if self.teacher is not None:
                 return self._feature_distillation_step(batch, "train")
@@ -264,6 +315,8 @@ class ModelInterface(pl.LightningModule):
 
     # Caution: self.model.eval() is invoked and this function executes within a <with torch.no_grad()> context
     def validation_step(self, batch, batch_idx):
+        if self.task == "tracking":
+            return self._tracking_step(batch, "val")
         if self.task == "segmentation":
             if self.teacher is not None:
                 return self._feature_distillation_step(batch, "val")
@@ -272,6 +325,8 @@ class ModelInterface(pl.LightningModule):
 
     # Caution: self.model.eval() is invoked and this function executes within a <with torch.no_grad()> context
     def test_step(self, batch, batch_idx):
+        if self.task == "tracking":
+            return self._tracking_step(batch, "test")
         if self.task == "segmentation":
             if self.teacher is not None:
                 return self._feature_distillation_step(batch, "test")
@@ -326,6 +381,79 @@ class ModelInterface(pl.LightningModule):
                      prog_bar=True, sync_dist=True, batch_size=bs)
             self.log(f'{stage}_boundary_f', bf, on_step=False, on_epoch=True,
                      prog_bar=False, sync_dist=True, batch_size=bs)
+
+        return {'loss': loss, 'pred': logits, 'ground_truth': mask}
+
+    def _tracking_step(self, batch, stage):
+        """Temporal tracking step over a clip.
+
+        Batch contract (from ``HandEventClipDataset`` + default collate):
+        ``(voxel(N,T,C,H,W), mask(N,T,H,W), meta)``. The model carries a
+        recurrent memory + previous-mask feedback across the ``T`` frames and
+        returns ``logits(N,T,1,H,W)``. Supervision is per-frame BCE+Dice (the
+        clip flattened to ``N*T`` independent frames), plus an optional
+        static-region temporal-consistency penalty that directly attacks the
+        frame-to-frame mask jitter this model exists to fix.
+        """
+        if len(batch) == 3:
+            voxel, mask, _meta = batch
+        else:
+            voxel, mask = batch  # tolerate a 2-tuple form
+        # voxel (N,T,C,H,W), mask (N,T,H,W)
+        logits = self(voxel)            # (N, T, 1, H, W)
+        n, t = logits.shape[0], logits.shape[1]
+        h, w = logits.shape[-2:]
+
+        # Flatten the clip's frames into the batch dim so the per-pixel
+        # BCE+Dice (and the IoU/Dice/boundary metrics) apply per-frame.
+        logits_flat = logits.reshape(n * t, logits.shape[2], h, w)
+        mask_flat = mask.reshape(n * t, h, w)
+
+        terms = self.seg_loss(logits_flat, mask_flat)
+        loss = terms["total"]
+
+        # Static-region anti-flicker: penalize change in predicted probability
+        # across consecutive frames at pixels that saw no events in the later
+        # frame (which therefore *should* stay put). Targets the exact failure
+        # mode — a still limb's mask blinking — without over-smoothing moving
+        # boundaries, where events are present and the term is inactive.
+        if self.temporal_consistency_weight > 0.0 and t >= 2:
+            prob = torch.sigmoid(logits[:, :, 0])      # (N, T, H, W)
+            dens = voxel.abs().sum(dim=2)              # (N, T, H, W) event activity
+            static = (dens[:, 1:] <= 0).float()
+            diff = (prob[:, 1:] - prob[:, :-1]).abs()
+            tc = (diff * static).sum() / static.sum().clamp(min=1.0)
+            loss = loss + self.temporal_consistency_weight * tc
+            self.log(f'{stage}_tc_loss', tc, on_step=True, on_epoch=True,
+                     prog_bar=False, sync_dist=True, batch_size=n)
+
+        self.log(f'{stage}_loss', loss, on_step=True, on_epoch=True,
+                 prog_bar=True, sync_dist=True, batch_size=n)
+        self.log(f'{stage}_bce_loss', terms["bce"], on_step=True, on_epoch=True,
+                 prog_bar=False, sync_dist=True, batch_size=n)
+        self.log(f'{stage}_dice_loss', terms["dice"], on_step=True, on_epoch=True,
+                 prog_bar=False, sync_dist=True, batch_size=n)
+
+        iou = binary_iou(logits_flat.detach(), mask_flat)
+        self.log(f'{stage}_iou', iou, on_step=True, on_epoch=True,
+                 prog_bar=True, sync_dist=True, batch_size=n)
+        if stage != "train":
+            dice = binary_dice(logits_flat.detach(), mask_flat)
+            bf = boundary_f_score(logits_flat.detach(), mask_flat, d_tolerance=2)
+            # Flicker: per-pixel fraction of binary on/off flips between
+            # consecutive frames, averaged over clips. The headline temporal
+            # metric — lower is steadier. (0 for degenerate T==1 clips.)
+            pred = (torch.sigmoid(logits[:, :, 0]) > 0.5).float()  # (N,T,H,W)
+            if t >= 2:
+                flicker = (pred[:, 1:] != pred[:, :-1]).float().mean()
+            else:
+                flicker = torch.zeros((), device=pred.device)
+            self.log(f'{stage}_dice', dice, on_step=False, on_epoch=True,
+                     prog_bar=True, sync_dist=True, batch_size=n)
+            self.log(f'{stage}_boundary_f', bf, on_step=False, on_epoch=True,
+                     prog_bar=False, sync_dist=True, batch_size=n)
+            self.log(f'{stage}_flicker', flicker, on_step=False, on_epoch=True,
+                     prog_bar=True, sync_dist=True, batch_size=n)
 
         return {'loss': loss, 'pred': logits, 'ground_truth': mask}
 

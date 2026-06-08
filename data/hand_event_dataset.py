@@ -221,6 +221,17 @@ class HandEventDataset(data.Dataset):
         # Lazy per-sequence handles, populated on first access in __getitem__.
         self._handles: Dict[str, Dict] = {}
 
+        # Detect native sensor resolution from the first FLIR frame. When
+        # image_height/image_width differ, event coordinates are rescaled
+        # rather than clipped.
+        self._native_h, self._native_w = self._detect_native_resolution()
+        self._scale_x = self.image_width / self._native_w
+        self._scale_y = self.image_height / self._native_h
+        self._needs_rescale = (
+            self._native_h != self.image_height
+            or self._native_w != self.image_width
+        )
+
         # Build the (seq_idx, frame_idx) index up front. Cheap — only reads
         # boundaries.json + checks for teacher mask files.
         self.index: List[Tuple[int, int]] = []
@@ -236,6 +247,16 @@ class HandEventDataset(data.Dataset):
             )
 
     # ------------------------------------------------------------------ utils
+
+    def _detect_native_resolution(self) -> Tuple[int, int]:
+        """Read a single FLIR PNG header to discover the sensor resolution."""
+        for seq in self.sequences:
+            frame_dir = seq / "proc" / "flir" / "frame"
+            for p in sorted(frame_dir.glob("*.png"))[:1]:
+                img = cv2.imread(str(p), cv2.IMREAD_UNCHANGED)
+                if img is not None:
+                    return img.shape[0], img.shape[1]
+        return self.image_height, self.image_width
 
     def _sequence_frame_count(self, seq_dir: Path) -> int:
         flir_t_path = seq_dir / "proc" / "flir" / "flir_t.npy"
@@ -317,11 +338,14 @@ class HandEventDataset(data.Dataset):
     def __len__(self) -> int:
         return len(self.index)
 
-    def __getitem__(self, idx: int):
-        s_idx, f_idx = self.index[idx]
-        seq_dir = self.sequences[s_idx]
-        h = self._get_handle(seq_dir)
+    def _load_frame(self, seq_dir: Path, h: Dict, f_idx: int):
+        """Load one frame's ``(voxel, mask, rgb, n_events, t_center)`` — no aug.
 
+        Pure I/O + voxelization for a single ``(sequence, frame)``; the
+        augmentation and meta-dict assembly live in ``__getitem__`` (single
+        frame) / the clip dataset (shared-across-clip aug) so both can reuse
+        this. ``rgb`` is ``None`` unless ``provide_rgb``.
+        """
         t_center = float(h["flir_t"][f_idx])
         half = (self.window_ms / 1000.0) * h["unit"] / 2.0
         t_start = t_center - half
@@ -333,6 +357,11 @@ class HandEventDataset(data.Dataset):
         t_slice = np.asarray(events_t[lo:hi])
         xy_slice = np.asarray(h["events_xy"][lo:hi])
         p_slice = np.asarray(h["events_p"][lo:hi])
+
+        if self._needs_rescale and xy_slice.size > 0:
+            xy_slice = xy_slice.astype(np.float32)
+            xy_slice[:, 0] = xy_slice[:, 0] * self._scale_x
+            xy_slice[:, 1] = xy_slice[:, 1] * self._scale_y
 
         voxel = voxel_grid(
             t=t_slice, xy=xy_slice, p=p_slice,
@@ -371,6 +400,15 @@ class HandEventDataset(data.Dataset):
                 )
             rgb = torch.from_numpy(rgb_img).permute(2, 0, 1).contiguous().float() / 255.0
 
+        return voxel, mask, rgb, hi - lo, t_center
+
+    def __getitem__(self, idx: int):
+        s_idx, f_idx = self.index[idx]
+        seq_dir = self.sequences[s_idx]
+        h = self._get_handle(seq_dir)
+
+        voxel, mask, rgb, n_events, t_center = self._load_frame(seq_dir, h, f_idx)
+
         if self._aug_active:
             # Per-sample RNG derived from idx + python's global seed (set per
             # worker by Lightning's seed_everything). Avoids cross-worker
@@ -382,7 +420,7 @@ class HandEventDataset(data.Dataset):
             "sequence": seq_dir.name,
             "frame_index": f_idx,
             "t_center": t_center,
-            "n_events": hi - lo,
+            "n_events": n_events,
         }
         if self.provide_rgb:
             return voxel, mask, rgb, meta

@@ -1,0 +1,149 @@
+# Phase B tracking: HandEventClipDataset + EventTrackUnet (recurrent ANN) with
+# BCE+Dice distillation on the cached SAM 2 masks, plus a static-region
+# anti-flicker penalty. Setting TRAINING.task="tracking" tells ModelInterface to
+# use the temporal clip contract (voxel(N,T,C,H,W), mask(N,T,H,W), meta) and run
+# the recurrent _tracking_step instead of independent per-frame segmentation.
+#
+# Motivation vs. hand_segmentation.yaml: the per-frame EventUnet produces a
+# mask that JITTERS frame-to-frame (a momentarily-still limb emits no events for
+# a window and blinks out). EventTrackUnet carries a ConvGRU memory + the
+# previous mask across frames (SAM2-style propagation) to keep it steady. Watch
+# val_flicker (lower = steadier) alongside val_iou.
+
+TRAINING:
+  deterministic: False
+  use_compile: False
+  inference_mode: False
+  seed: 42
+  max_epochs: 50
+  task: tracking
+  # BCE positive-class weight for the cached-mask loss. null = off. Raise to
+  # ~5-20 if val_iou stalls because the model collapses to all-zero masks.
+  seg_pos_weight: null
+  # Static-region temporal-consistency (anti-flicker) penalty weight. Penalizes
+  # prediction changes across consecutive clip frames at pixels with no events.
+  # Set 0.0 to train the recurrent model on BCE+Dice alone (memory/prev-mask
+  # already reduce jitter); raise toward ~1.0 to push harder on stability.
+  temporal_consistency_weight: 0.5
+  # One stateful preview video per rank at each validation epoch. With 4 GPUs
+  # this renders 4 held-out sequences run end-to-end through the tracker.
+  val_preview_count: 4
+
+DISTRIBUTED:
+  accelerator: gpu
+  devices: 4
+  num_nodes: 1
+  strategy: auto
+
+DATA:
+  dataset:
+    file_name: hand_event_clip_dataset
+    class_name: HandEventClipDataset
+    dataset_init_args:
+      root_dir: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNew
+      voxel_bins: 5
+      window_ms: 36.0
+      image_height: 240
+      image_width: 320
+      held_out_subject: tuxun       # LOSO held-out subject for val/test
+      require_teacher: True         # set False before running sam2_pseudo_labels.py
+      action_only: True
+      mask_root: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNewTeacherMasks   # complete SAM 2 teacher masks
+      provide_rgb: False
+      num_classes: 1
+      # Temporal clip window: T consecutive kept frames per sample. The
+      # recurrent memory is unrolled (and BPTT'd) over clip_len frames, so keep
+      # it modest to bound GPU memory / backprop depth. clip_stride is the gap
+      # between clip starts in kept-frame units (4 = 50% overlap at clip_len 8).
+      clip_len: 8
+      clip_stride: 4
+      # Train-only spatial augmentation, applied IDENTICALLY across a clip's
+      # frames (the clip dataset re-seeds the same transform per frame) so the
+      # random flip/affine never breaks temporal coherence within a clip.
+      augmentation:
+        enabled: True
+        hflip_prob: 0.5
+        affine_prob: 0.5
+        rotate_deg: 10.0
+        scale_range: [0.9, 1.1]
+        translate_frac: 0.05
+  dataloader:
+    # Clips are clip_len times larger than frames in memory, and the recurrent
+    # unroll stores per-frame activations for BPTT — so the per-step footprint is
+    # ~clip_len x a single-frame step. Keep the clip batch small.
+    batch_size: 4
+    test_batch_size: 2
+    num_workers: 8
+    persistent_workers: True
+    pin_memory: True
+    multiprocessing_context: fork
+    drop_last: True
+    shuffle_train: True
+    shuffle_val: False
+    shuffle_test: False
+
+MODEL:
+  file_name: event_track_unet
+  class_name: EventTrackUnet
+  model_init_args:
+    in_channels: 5                  # = voxel_bins
+    # Same backbone widths as the per-frame EventUnet (~0.65M) plus the ConvGRU
+    # memory (~0.15M) → ~0.8M params total. Bump to [64,128,192,256] if mask
+    # quality is capacity-limited.
+    encoder_channels: [48, 96, 128, 160]
+    num_classes: 1
+    # GroupNorm (no running stats) preferred under the LOSO split, as in EventUnet.
+    norm: gn
+    gn_groups: 8
+    use_se: True
+    use_context: True
+    context_dilations: [1, 2, 4]
+    # Concatenate the previous frame's predicted mask probability as an extra
+    # input channel (SAM2-style mask conditioning). Set False to rely on the
+    # ConvGRU hidden state alone for an ablation.
+    use_prev_mask: True
+
+OPTIMIZER:
+  name: AdamW
+  arguments:
+    lr: 3e-4
+    weight_decay: 1e-4
+  gradient_accumulation:
+    enabled: False
+    scheduling: {0: 4, 4: 2, 8: 1}
+  gradient_clip:
+    # Recurrent unroll → keep gradient clipping on to tame BPTT spikes.
+    enabled: True
+    gradient_clip_val: 1.0
+    gradient_clip_algorithm: norm
+  stochastic_weight_averaging:
+    enabled: False
+    swa_lrs: 1e-2
+
+SCHEDULER:
+  learning_rate:
+    enabled: True
+    name: CosineAnnealingLR
+    arguments:
+      T_max: 50
+      eta_min: 1e-6
+  early_stopping:
+    enabled: False
+    monitor: val_loss_epoch
+    mode: min
+    patience: 5
+    min_delta: 1e-5
+
+LOGGER:
+  log_dir_root: lightning_logs
+  experiment_name: hand_tracking_phaseB_eventtrackunet
+
+CHECKPOINT:
+  enabled: True
+  every_n_epochs: 1
+  # Tracking: highest mIoU wins (val_flicker is also logged for steadiness).
+  monitor: val_iou_epoch
+  mode: max
+  filename: "best-{epoch:03d}-{val_iou_epoch:.4f}"
+  save_top_k: 1
+  save_last: True
