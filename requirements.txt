@@ -4,3 +4,11 @@ rich==14.2.0
 torch==2.7.1
 torchmetrics==1.5.1
 torchvision==0.18.1
+
+# Event-native sparse model (configs/hand_event_seg_sparse.yaml) needs spconv v2.
+# Install the wheel matching your CUDA toolkit (left commented so the base
+# install is not pinned to a specific CUDA build):
+#   pip install spconv-cu120   # CUDA 12.x  (e.g. the L40S box)
+#   pip install spconv-cu118   # CUDA 11.8
+# Jetson/Orin (aarch64, SM_87): no prebuilt wheels -- build spconv from source.
+# spconv-cu120

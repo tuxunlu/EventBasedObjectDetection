@@ -8,10 +8,12 @@ import lightning.pytorch as pl
 from loss.loss_funcs import cross_entropy_loss
 from loss.distillation import DistillationLoss
 from loss.feature_distillation import FeatureDistillationLoss
+from loss.event_distillation import EventDistillationLoss
 from torchmetrics.functional.classification import multiclass_accuracy
 from utils.metrics.segmentation import (
     binary_iou, binary_dice, boundary_f_score,
 )
+from utils.metrics.event_seg import event_f1, event_accuracy, event_pred_to_dense_iou
 from configs.sections import (
     ModelConfig,
     OptimizerConfig,
@@ -22,7 +24,7 @@ from configs.sections import (
 
 
 class ModelInterface(pl.LightningModule):
-    SUPPORTED_TASKS = ("classification", "segmentation", "tracking")
+    SUPPORTED_TASKS = ("classification", "segmentation", "tracking", "event_segmentation")
 
     def __init__(
         self,
@@ -83,6 +85,7 @@ class ModelInterface(pl.LightningModule):
             getattr(training_cfg, "temporal_consistency_weight", 0.0) or 0.0
         )
         self.feature_distill_loss = None
+        self.event_loss = None
         if self.task in ("segmentation", "tracking"):
             # The tracking task is Phase-B (cached-mask BCE+Dice) only; the
             # online feature-distillation teacher is a segmentation-only path.
@@ -108,6 +111,12 @@ class ModelInterface(pl.LightningModule):
                     pos_weight=float(pos_weight) if pos_weight is not None else None,
                 )
             self.loss_function = None  # not used in segmentation path
+        elif self.task == "event_segmentation":
+            # Per-event sparse path: BCE (+optional focal/Dice) on per-site logits.
+            event_cfg = dict(getattr(training_cfg, "event_loss_config", None) or {})
+            self.event_loss = EventDistillationLoss(**event_cfg)
+            self.seg_loss = None
+            self.loss_function = None
         else:
             self.loss_function = self.__configure_loss()
 
@@ -307,6 +316,8 @@ class ModelInterface(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         if self.task == "tracking":
             return self._tracking_step(batch, "train")
+        if self.task == "event_segmentation":
+            return self._event_segmentation_step(batch, "train")
         if self.task == "segmentation":
             if self.teacher is not None:
                 return self._feature_distillation_step(batch, "train")
@@ -317,6 +328,8 @@ class ModelInterface(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         if self.task == "tracking":
             return self._tracking_step(batch, "val")
+        if self.task == "event_segmentation":
+            return self._event_segmentation_step(batch, "val")
         if self.task == "segmentation":
             if self.teacher is not None:
                 return self._feature_distillation_step(batch, "val")
@@ -327,6 +340,8 @@ class ModelInterface(pl.LightningModule):
     def test_step(self, batch, batch_idx):
         if self.task == "tracking":
             return self._tracking_step(batch, "test")
+        if self.task == "event_segmentation":
+            return self._event_segmentation_step(batch, "test")
         if self.task == "segmentation":
             if self.teacher is not None:
                 return self._feature_distillation_step(batch, "test")
@@ -529,6 +544,47 @@ class ModelInterface(pl.LightningModule):
                          prog_bar=False, sync_dist=True, batch_size=bs)
 
         return {'loss': loss, 'pred': logits, 'ground_truth': mask}
+
+    def _event_segmentation_step(self, batch, stage):
+        """Per-event sparse path: ``SparseEventBatch`` -> per-site logits -> per-event loss.
+
+        ``batch`` is a ``SparseEventBatch`` (from ``data/sparse_event_collate.py``).
+        The model returns one logit per active event site, row-aligned to
+        ``batch.labels``. Empty windows (no events) are skipped by returning ``None``.
+        """
+        logits = self(batch)                 # (N,) per-site logits
+        labels = batch.labels
+        if labels.numel() == 0:
+            return None                      # nothing to supervise this batch
+
+        terms = self.event_loss(logits, labels, batch_idx=batch.batch_idx)
+        loss = terms["total"]
+
+        bs = batch.batch_size
+        self.log(f'{stage}_loss', loss, on_step=True, on_epoch=True,
+                 prog_bar=True, sync_dist=True, batch_size=bs)
+        self.log(f'{stage}_bce_loss', terms["bce"], on_step=True, on_epoch=True,
+                 prog_bar=False, sync_dist=True, batch_size=bs)
+
+        f1 = event_f1(logits.detach(), labels)
+        acc = event_accuracy(logits.detach(), labels)
+        self.log(f'{stage}_event_f1', f1, on_step=True, on_epoch=True,
+                 prog_bar=True, sync_dist=True, batch_size=bs)
+        self.log(f'{stage}_event_acc', acc, on_step=True, on_epoch=True,
+                 prog_bar=False, sync_dist=True, batch_size=bs)
+
+        # Rasterized dense IoU: scatter per-event predictions to a dense mask and
+        # reuse binary_iou vs the teacher, so val_iou_epoch is directly comparable
+        # to the dense baseline. val/test only, to keep train steps lean.
+        if stage != "train":
+            iou = event_pred_to_dense_iou(
+                batch.coords, logits.detach(), batch.batch_idx,
+                batch.dense_mask, bs, batch.height, batch.width,
+            )
+            self.log(f'{stage}_iou', iou, on_step=False, on_epoch=True,
+                     prog_bar=True, sync_dist=True, batch_size=bs)
+
+        return {'loss': loss, 'pred': logits, 'ground_truth': labels}
 
     def __build_teacher(self, teacher_cfg):
         """Construct the configured online teacher. Currently SAM 2 only."""

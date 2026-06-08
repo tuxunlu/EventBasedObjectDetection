@@ -35,6 +35,11 @@ class DataInterface(pl.LightningDataModule):
 
         self.train_set, self.validation_set, self.test_set = self.__load_data_module()
 
+        # Optional ragged collate for per-event datasets: HandEventStreamDataset
+        # exposes a `collate_fn` staticmethod. None -> PyTorch default collate, so
+        # the dense datasets are unaffected.
+        self._collate_fn = getattr(self.train_set, "collate_fn", None)
+
     # Lightning hook function, override to implement loading train dataset
     def train_dataloader(self):
         return DataLoader(
@@ -46,6 +51,7 @@ class DataInterface(pl.LightningDataModule):
             pin_memory=self.dataloader_cfg.pin_memory,
             multiprocessing_context=self.dataloader_cfg.multiprocessing_context,
             drop_last=self.dataloader_cfg.drop_last,
+            collate_fn=self._collate_fn,
         )
 
     # Lightning hook function, override to implement loading validation dataset
@@ -60,6 +66,7 @@ class DataInterface(pl.LightningDataModule):
             pin_memory=self.dataloader_cfg.pin_memory,
             multiprocessing_context=self.dataloader_cfg.multiprocessing_context,
             drop_last=self.dataloader_cfg.drop_last,
+            collate_fn=self._collate_fn,
         )
 
     # Lightning hook function, override to implement loading test dataset
@@ -74,6 +81,7 @@ class DataInterface(pl.LightningDataModule):
             pin_memory=self.dataloader_cfg.pin_memory,
             multiprocessing_context=self.dataloader_cfg.multiprocessing_context,
             drop_last=self.dataloader_cfg.drop_last,
+            collate_fn=self._collate_fn,
         )
     
     @staticmethod

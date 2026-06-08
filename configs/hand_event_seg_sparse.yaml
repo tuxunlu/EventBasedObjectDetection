@@ -1,0 +1,116 @@
+# Event-native per-event segmentation (Phase 1).
+#
+# Differences vs configs/hand_segmentation.yaml (dense voxel U-Net):
+#   - TASK = event_segmentation -> ModelInterface routes to _event_segmentation_step,
+#     which consumes a SparseEventBatch and supervises one logit per event site.
+#   - DATA = HandEventStreamDataset -> yields deduplicated per-pixel event sites with
+#     per-site labels sampled from the cached SAM 2 teacher masks. Its `collate_fn`
+#     staticmethod is auto-selected by DataInterface for ragged batching.
+#   - MODEL = EventSparseSeg -> submanifold sparse-conv U-Net (~0.19M params),
+#     output sites == input event sites.
+#
+# Requires spconv v2 (see requirements.txt). Start single-GPU on L40S; scale
+# DISTRIBUTED.devices once the pipeline is validated.
+
+TRAINING:
+  deterministic: False
+  use_compile: False          # torch.compile + spconv custom ops don't mix
+  inference_mode: False
+  seed: 42
+  max_epochs: 50
+  task: event_segmentation
+  # Per-event loss (EventDistillationLoss). Foreground (hand/arm) events are a
+  # minority of the stream, so a pos_weight > 1 counters the imbalance. Tune
+  # pos_weight to the observed fg:bg site ratio; enable focal_weight for stronger
+  # control if BCE alone collapses to background.
+  event_loss_config:
+    bce_weight: 1.0
+    pos_weight: 2.0
+    focal_weight: 0.0
+    dice_weight: 0.0
+
+DISTRIBUTED:
+  accelerator: gpu
+  devices: 1                  # single-GPU bring-up; raise after validation
+  num_nodes: 1
+  strategy: auto
+
+DATA:
+  dataset:
+    file_name: hand_event_stream_dataset
+    class_name: HandEventStreamDataset
+    dataset_init_args:
+      root_dir: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNew
+      window_ms: 36.0
+      image_height: 480
+      image_width: 640
+      held_out_subject: tuxun           # LOSO held-out subject for val/test
+      require_teacher: True
+      action_only: False
+      mask_root: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNewTeacherMasks
+      max_events: 150000                # cap per window (bursty-window guard)
+      num_classes: 1                    # consumed by ModelInterface + config validator
+  dataloader:
+    batch_size: 8                       # sparse is light; bump until GPU-bound
+    test_batch_size: 8
+    num_workers: 8
+    persistent_workers: True
+    pin_memory: True                    # SparseEventBatch implements pin_memory()
+    multiprocessing_context: fork
+    drop_last: True
+    shuffle_train: True
+    shuffle_val: False
+    shuffle_test: False
+
+MODEL:
+  file_name: event_sparse_seg
+  class_name: EventSparseSeg
+  model_init_args:
+    in_features: 3                      # = HandEventStreamDataset.NUM_FEATURES
+    stage_channels: [16, 32, 48, 64]    # ~0.19M params (<=300K target)
+    num_classes: 1
+    norm: ln                            # LayerNorm over channels: LOSO-safe default
+
+OPTIMIZER:
+  name: AdamW
+  arguments:
+    lr: 3e-4
+    weight_decay: 1e-4
+  gradient_accumulation:
+    enabled: False
+    scheduling: {0: 4, 4: 2, 8: 1}
+  gradient_clip:
+    enabled: True
+    gradient_clip_val: 1.0
+    gradient_clip_algorithm: norm
+  stochastic_weight_averaging:
+    enabled: False
+    swa_lrs: 1e-2
+
+SCHEDULER:
+  learning_rate:
+    enabled: True
+    name: CosineAnnealingLR
+    arguments:
+      T_max: 50
+      eta_min: 1e-6
+  early_stopping:
+    enabled: False
+    monitor: val_loss_epoch
+    mode: min
+    patience: 5
+    min_delta: 1e-5
+
+LOGGER:
+  log_dir_root: lightning_logs
+  experiment_name: hand_event_seg_sparse
+
+CHECKPOINT:
+  enabled: True
+  every_n_epochs: 1
+  # Rasterized dense IoU, comparable to the dense baseline's val_iou_epoch.
+  monitor: val_iou_epoch
+  mode: max
+  filename: "best-{epoch:03d}-{val_iou_epoch:.4f}"
+  save_top_k: 1
+  save_last: True
