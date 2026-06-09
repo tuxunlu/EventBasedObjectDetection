@@ -181,13 +181,14 @@ def render_sequence(model, val_set, s_idx, max_frames, device):
         pred_masks.append(pred_np * 255)
 
         # Crop the original event panel to the predicted region: keep event
-        # colors where the prediction is foreground, black out the rest. Resize
-        # the mask to the panel grid (nearest) in case the model output stride
-        # differs from the event-panel resolution.
+        # colors where the prediction is foreground, fill the rest with the same
+        # gray (128) the Events panel uses as its background so the two panels
+        # match visually. Resize the mask to the panel grid (nearest) in case the
+        # model output stride differs from the event-panel resolution.
         ph, pw = ev_panel.shape[:2]
         keep = pred_np if pred_np.shape == (ph, pw) else cv2.resize(
             pred_np, (pw, ph), interpolation=cv2.INTER_NEAREST)
-        cropped = np.where(keep[:, :, None].astype(bool), ev_panel, 0).astype(np.uint8)
+        cropped = np.where(keep[:, :, None].astype(bool), ev_panel, 128).astype(np.uint8)
         cropped_panels.append(cropped)
 
         if float(mask.sum()) > 0:

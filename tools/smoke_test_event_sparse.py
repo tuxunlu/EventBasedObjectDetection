@@ -54,6 +54,10 @@ def main() -> int:
     ap.add_argument("--width", type=int, default=640)
     ap.add_argument("--in_features", type=int, default=3)
     ap.add_argument("--max_params", type=int, default=300_000)
+    ap.add_argument("--algo", default=None,
+                    help="spconv conv algo: 'native' avoids the implicit-GEMM "
+                         "SIGFPE under a CUDA runtime newer than the spconv wheel "
+                         "(default: spconv's own choice).")
     ap.add_argument("--bench", action="store_true", help="time forward passes")
     args = ap.parse_args()
 
@@ -71,7 +75,8 @@ def main() -> int:
     print(f"[data ] batch_size={batch.batch_size} total_sites={n_sites} "
           f"feat_dim={batch.feats.shape[1]}")
 
-    model = EventSparseSeg(in_features=args.in_features, num_classes=1).to(device)
+    model = EventSparseSeg(in_features=args.in_features, num_classes=1,
+                           algo=args.algo).to(device)
     n_params = model.count_parameters()
     print(f"[model] params={n_params:,}  (budget <= {args.max_params:,})")
     assert n_params <= args.max_params, "parameter budget exceeded"

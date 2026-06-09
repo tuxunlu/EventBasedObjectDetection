@@ -169,13 +169,16 @@ class ModelInterface(pl.LightningModule):
 
         For the tracking task the model is run *statefully* across the whole
         sequence (memory + prev-mask carried frame to frame), so the preview
-        shows the actual temporal behavior — i.e. whether the jitter is gone.
+        shows the actual temporal behavior — i.e. whether the jitter is gone. The
+        event_segmentation task renders the same Events | Teacher (GT) |
+        Prediction triptych, but per-frame over the sparse event-site stream (the
+        per-event prediction is rasterized to a dense mask for the panel).
 
         Skipped during the sanity-check pass. Visualization must never take
         training down, so any failure is caught and logged; a rank that fails
         just renders nothing and still meets the others at the next collective.
         """
-        if self.task not in ("segmentation", "tracking"):
+        if self.task not in ("segmentation", "tracking", "event_segmentation"):
             return
         n = int(getattr(self.training_cfg, "val_preview_count", 0) or 0)
         if n <= 0:
@@ -183,9 +186,55 @@ class ModelInterface(pl.LightningModule):
         if getattr(self.trainer, "sanity_checking", False):
             return
         try:
-            self._save_validation_previews(n)
+            if self.task == "event_segmentation":
+                self._save_event_validation_previews(n)
+            else:
+                self._save_validation_previews(n)
         except Exception as exc:  # noqa: BLE001 - never crash training on viz
             print(f"[viz] validation preview skipped ({type(exc).__name__}: {exc})")
+
+    def _select_preview_sequence(self, val_set, n: int, max_frames: int = 600):
+        """Pick this rank's preview sequence + strided frame positions, or None.
+
+        Shared by the dense (segmentation/tracking) and sparse (event) preview
+        renderers so they select sequences identically: a deterministic shuffle
+        of all val sequences — seeded the same on every rank so the ordering
+        matches without any cross-rank communication — then this rank renders the
+        sequence at its global-rank slot within the first ``n`` eligible. The
+        in-sequence frame positions (``val_set.index`` is in ``(seq, frame)``
+        order) are strided down to ``max_frames`` to keep a preview cheap.
+        Returns ``(s_idx, positions)`` or ``None`` when this rank has nothing to
+        render or the val set exposes no sequence index.
+        """
+        from math import ceil
+
+        if val_set is None or not hasattr(val_set, "sequences") \
+                or not hasattr(val_set, "index"):
+            print("[viz] validation set has no sequence index; skipping previews")
+            return None
+
+        if self._preview_seq_ids is None:
+            import random as _random
+            rng = _random.Random(int(getattr(self.training_cfg, "seed", 0)))
+            ids = list(range(len(val_set.sequences)))
+            rng.shuffle(ids)
+            self._preview_seq_ids = ids
+
+        # One video per rank: ranks beyond the available sequences (or the cap)
+        # render nothing and just proceed to the next collective.
+        rank = int(getattr(self.trainer, "global_rank", 0) or 0)
+        eligible = self._preview_seq_ids[:n]
+        if rank >= len(eligible):
+            return None
+        s_idx = eligible[rank]
+
+        positions = [i for i, (si, _f) in enumerate(val_set.index) if si == s_idx]
+        if not positions:
+            return None
+        if len(positions) > max_frames:
+            stride = ceil(len(positions) / max_frames)
+            positions = positions[::stride]
+        return s_idx, positions
 
     @torch.no_grad()
     def _save_validation_previews(self, n: int):
@@ -201,52 +250,22 @@ class ModelInterface(pl.LightningModule):
         strided down to a frame cap so a preview stays cheap.
         """
         from pathlib import Path
-        from math import ceil
 
         from utils.metrics.segmentation import binary_iou
         from utils.viz.val_preview import (
             events_panel_from_voxel, infer_fps, write_triptych_video,
         )
 
-        MAX_FRAMES = 600
-
         dm = getattr(self.trainer, "datamodule", None)
         val_set = getattr(dm, "validation_set", None) if dm is not None else None
-        if val_set is None or not hasattr(val_set, "sequences") \
-                or not hasattr(val_set, "index"):
-            print("[viz] validation set has no sequence index; skipping previews")
+        picked = self._select_preview_sequence(val_set, n)
+        if picked is None:
             return
-
-        # Deterministic shuffle of all val sequences, chosen once and reused. The
-        # rng is seeded identically on every rank, so the ordering matches and
-        # each rank can pick its own slot without any cross-rank communication.
-        if self._preview_seq_ids is None:
-            import random as _random
-            rng = _random.Random(int(getattr(self.training_cfg, "seed", 0)))
-            ids = list(range(len(val_set.sequences)))
-            rng.shuffle(ids)
-            self._preview_seq_ids = ids
-
-        # One video per rank: this rank renders the sequence at its rank slot,
-        # bounded by the configured preview count. Ranks beyond the available
-        # sequences (or the cap) render nothing and just proceed.
-        rank = int(getattr(self.trainer, "global_rank", 0) or 0)
-        eligible = self._preview_seq_ids[:n]
-        if rank >= len(eligible):
-            return
-        s_idx = eligible[rank]
-
-        # Dataset positions whose sample belongs to this sequence, in frame
-        # order (val_set.index is built in (seq, frame) order).
-        positions = [i for i, (si, _f) in enumerate(val_set.index) if si == s_idx]
-        if not positions:
-            return
-        if len(positions) > MAX_FRAMES:
-            stride = ceil(len(positions) / MAX_FRAMES)
-            positions = positions[::stride]
+        s_idx, positions = picked
 
         out_dir = Path(self.trainer.log_dir or ".") / "val_previews"
         out_dir.mkdir(parents=True, exist_ok=True)
+        rank = int(getattr(self.trainer, "global_rank", 0) or 0)
 
         # Single-frame accessor: the clip dataset returns clips from __getitem__,
         # so it exposes frame_sample() for one-frame access; the plain seg dataset
@@ -305,6 +324,82 @@ class ModelInterface(pl.LightningModule):
             return infer_fps(handle.get("flir_t"))
         except Exception:  # noqa: BLE001
             return 30.0
+
+    @torch.no_grad()
+    def _save_event_validation_previews(self, n: int):
+        """Render this rank's held-out preview sequence for the sparse event path.
+
+        The event_segmentation analog of ``_save_validation_previews``: same
+        per-rank sequence selection and same Events | Teacher (GT) | Prediction
+        triptych, but each frame is the model's *sparse* per-event-site output.
+        For every frame the single-sample ``SparseEventBatch`` is run through the
+        model, the per-site logits are **rasterized to a dense (H, W) mask** (the
+        same scatter used for ``val_iou``), and the events panel is painted from
+        the active sites — so the panel, the prediction, and the logged IoU are
+        all built from exactly what the model saw and produced.
+        """
+        from pathlib import Path
+
+        from data.sparse_event_collate import collate_sparse_events
+        from utils.metrics.event_seg import (
+            event_pred_to_dense_iou, rasterize_events_to_logits,
+        )
+        from utils.viz.val_preview import (
+            events_panel_from_sites, infer_fps, write_triptych_video,
+        )
+
+        dm = getattr(self.trainer, "datamodule", None)
+        val_set = getattr(dm, "validation_set", None) if dm is not None else None
+        picked = self._select_preview_sequence(val_set, n)
+        if picked is None:
+            return
+        s_idx, positions = picked
+
+        out_dir = Path(self.trainer.log_dir or ".") / "val_previews"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        rank = int(getattr(self.trainer, "global_rank", 0) or 0)
+
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            event_panels, gt_masks, pred_masks, ious = [], [], [], []
+            for pos in positions:
+                coords, feats, labels, dense_mask, meta = val_set[pos]
+                batch = collate_sparse_events(
+                    [(coords, feats, labels, dense_mask, meta)]
+                ).to(self.device)
+                logits = self(batch)                         # (N,) per-site logits
+
+                h, w = batch.height, batch.width
+                raster = rasterize_events_to_logits(
+                    batch.coords, logits.detach(), batch.batch_idx, 1, h, w,
+                )[0]                                          # (H, W) dense logits
+                pred = (torch.sigmoid(raster) > 0.5).float()
+
+                event_panels.append(events_panel_from_sites(coords, feats, h, w))
+                gt_np = (dense_mask.detach().cpu().numpy() > 0).astype("uint8") * 255
+                gt_masks.append(gt_np)
+                pred_masks.append((pred.cpu().numpy() * 255).astype("uint8"))
+                # Per-frame rasterized IoU, only where the GT has foreground.
+                if float(dense_mask.sum()) > 0:
+                    ious.append(float(event_pred_to_dense_iou(
+                        batch.coords, logits.detach(), batch.batch_idx,
+                        batch.dense_mask, 1, h, w)))
+                else:
+                    ious.append(None)
+
+            seq_name = val_set.sequences[s_idx].name
+            fps = self._infer_preview_fps(val_set, s_idx, infer_fps)
+            out_path = out_dir / f"epoch{self.current_epoch:03d}_{seq_name}.mp4"
+            write_triptych_video(
+                event_panels, gt_masks, pred_masks, out_path,
+                fps=fps, title=seq_name, per_frame_iou=ious,
+            )
+            print(f"[viz] rank{rank} wrote {out_path} ({len(positions)} frames, "
+                  f"{fps:.1f} fps)")
+        finally:
+            if was_training:
+                self.model.train()
 
     # Caution: self.model.train() is invoked
     # For logging, check document: https://lightning.ai/docs/pytorch/stable/extensions/logging.html#automatic-logging
@@ -581,7 +676,11 @@ class ModelInterface(pl.LightningModule):
                 batch.coords, logits.detach(), batch.batch_idx,
                 batch.dense_mask, bs, batch.height, batch.width,
             )
-            self.log(f'{stage}_iou', iou, on_step=False, on_epoch=True,
+            # on_step=True (with on_epoch=True) so Lightning emits the
+            # ``{stage}_iou_epoch`` key the ModelCheckpoint monitors — the
+            # ``_epoch`` suffix is only added when both flags are set. Matches the
+            # dense segmentation/tracking steps, keeping val_iou_epoch comparable.
+            self.log(f'{stage}_iou', iou, on_step=True, on_epoch=True,
                      prog_bar=True, sync_dist=True, batch_size=bs)
 
         return {'loss': loss, 'pred': logits, 'ground_truth': labels}

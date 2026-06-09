@@ -40,6 +40,30 @@ import torch.nn as nn
 from model.sparse_backend import build_sparse_tensor, require_spconv
 
 
+def _resolve_algo(algo):
+    """Map a friendly algo name (or ``None``/``ConvAlgo``) to an spconv ``ConvAlgo``.
+
+    ``None`` preserves spconv's own default selection (no behavior change). A
+    string lets callers force a path — notably ``"native"`` (gather + dense
+    cuBLAS GEMM + scatter), which avoids the cumm implicit-GEMM tile heuristics
+    that divide-by-zero (SIGFPE) under a CUDA runtime newer than the one the
+    spconv wheel was built against.
+    """
+    if algo is None or not isinstance(algo, str):
+        return algo
+    from spconv.core import ConvAlgo
+    table = {
+        "native": ConvAlgo.Native,
+        "implicit_gemm": ConvAlgo.MaskImplicitGemm,
+        "mask_implicit_gemm": ConvAlgo.MaskImplicitGemm,
+        "mask_split_implicit_gemm": ConvAlgo.MaskSplitImplicitGemm,
+    }
+    key = algo.strip().lower()
+    if key not in table:
+        raise ValueError(f"unknown algo {algo!r}; choose from {sorted(table)}")
+    return table[key]
+
+
 def _make_norm1d(c: int, kind: str) -> nn.Module:
     """Norm over the per-site feature vector ``(N, C)``.
 
@@ -59,11 +83,12 @@ def _make_norm1d(c: int, kind: str) -> nn.Module:
 class _SubMBlock(nn.Module):
     """SubMConv -> norm -> ReLU. Preserves the active-site set (per-site refinement)."""
 
-    def __init__(self, c_in: int, c_out: int, indice_key: str, norm: str = "ln", k: int = 3):
+    def __init__(self, c_in: int, c_out: int, indice_key: str, norm: str = "ln", k: int = 3,
+                 algo=None):
         super().__init__()
         spconv = require_spconv()
         self.conv = spconv.SubMConv2d(c_in, c_out, kernel_size=k, bias=False,
-                                      indice_key=indice_key)
+                                      indice_key=indice_key, algo=algo)
         self.norm = _make_norm1d(c_out, norm)
         self.act = nn.ReLU(inplace=True)
 
@@ -75,11 +100,13 @@ class _SubMBlock(nn.Module):
 class _DownBlock(nn.Module):
     """Strided SparseConv (halves spatial res) -> norm -> ReLU. Expands the active set."""
 
-    def __init__(self, c_in: int, c_out: int, indice_key: str, norm: str = "ln", k: int = 3):
+    def __init__(self, c_in: int, c_out: int, indice_key: str, norm: str = "ln", k: int = 3,
+                 algo=None):
         super().__init__()
         spconv = require_spconv()
         self.conv = spconv.SparseConv2d(c_in, c_out, kernel_size=k, stride=2,
-                                        padding=k // 2, bias=False, indice_key=indice_key)
+                                        padding=k // 2, bias=False, indice_key=indice_key,
+                                        algo=algo)
         self.norm = _make_norm1d(c_out, norm)
         self.act = nn.ReLU(inplace=True)
 
@@ -91,11 +118,12 @@ class _DownBlock(nn.Module):
 class _UpBlock(nn.Module):
     """SparseInverseConv keyed to a prior ``_DownBlock`` -> norm -> ReLU. Restores its sites."""
 
-    def __init__(self, c_in: int, c_out: int, indice_key: str, norm: str = "ln", k: int = 3):
+    def __init__(self, c_in: int, c_out: int, indice_key: str, norm: str = "ln", k: int = 3,
+                 algo=None):
         super().__init__()
         spconv = require_spconv()
         self.conv = spconv.SparseInverseConv2d(c_in, c_out, kernel_size=k, bias=False,
-                                               indice_key=indice_key)
+                                               indice_key=indice_key, algo=algo)
         self.norm = _make_norm1d(c_out, norm)
         self.act = nn.ReLU(inplace=True)
 
@@ -119,6 +147,14 @@ class EventSparseSeg(nn.Module):
         Output channels per site. ``1`` for a binary foreground logit.
     norm
         ``"ln"`` (default, LOSO-safe), ``"bn"``, or ``"none"``.
+    algo
+        Sparse-conv algorithm forwarded to every spconv layer. ``None`` (default)
+        keeps spconv's own selection. Pass ``"native"`` to force the gather +
+        dense cuBLAS GEMM + scatter path, which avoids the cumm implicit-GEMM
+        tile heuristics that SIGFPE when the spconv wheel's build-time CUDA is
+        older than the runtime (e.g. a cu120 wheel under a cu128 torch). Also
+        accepts ``"implicit_gemm"`` / ``"mask_split_implicit_gemm"`` or a raw
+        ``spconv.core.ConvAlgo``.
     """
 
     def __init__(
@@ -127,6 +163,7 @@ class EventSparseSeg(nn.Module):
         stage_channels: Sequence[int] = (16, 32, 48, 64),
         num_classes: int = 1,
         norm: str = "ln",
+        algo=None,
     ):
         super().__init__()
         spconv = require_spconv()  # fail fast with a clear install hint
@@ -135,30 +172,31 @@ class EventSparseSeg(nn.Module):
         c0, c1, c2, c3 = (int(c) for c in stage_channels)
         self.in_features = int(in_features)
         self.num_classes = int(num_classes)
+        algo = _resolve_algo(algo)
 
         # Stem keeps full resolution (submanifold) -> sites == input event sites.
-        self.stem = _SubMBlock(in_features, c0, indice_key="subm0", norm=norm)
+        self.stem = _SubMBlock(in_features, c0, indice_key="subm0", norm=norm, algo=algo)
 
         # Encoder: each level downsamples (sp{n}) then refines (subm{n}).
-        self.down1 = _DownBlock(c0, c1, indice_key="sp1", norm=norm)
-        self.enc1 = _SubMBlock(c1, c1, indice_key="subm1", norm=norm)
-        self.down2 = _DownBlock(c1, c2, indice_key="sp2", norm=norm)
-        self.enc2 = _SubMBlock(c2, c2, indice_key="subm2", norm=norm)
-        self.down3 = _DownBlock(c2, c3, indice_key="sp3", norm=norm)
-        self.enc3 = _SubMBlock(c3, c3, indice_key="subm3", norm=norm)
+        self.down1 = _DownBlock(c0, c1, indice_key="sp1", norm=norm, algo=algo)
+        self.enc1 = _SubMBlock(c1, c1, indice_key="subm1", norm=norm, algo=algo)
+        self.down2 = _DownBlock(c1, c2, indice_key="sp2", norm=norm, algo=algo)
+        self.enc2 = _SubMBlock(c2, c2, indice_key="subm2", norm=norm, algo=algo)
+        self.down3 = _DownBlock(c2, c3, indice_key="sp3", norm=norm, algo=algo)
+        self.enc3 = _SubMBlock(c3, c3, indice_key="subm3", norm=norm, algo=algo)
 
         # Decoder: inverse conv keyed to the matching down stage restores its
         # exact sites; skip-add then refine.
-        self.up3 = _UpBlock(c3, c2, indice_key="sp3", norm=norm)
-        self.dec2 = _SubMBlock(c2, c2, indice_key="subm2d", norm=norm)
-        self.up2 = _UpBlock(c2, c1, indice_key="sp2", norm=norm)
-        self.dec1 = _SubMBlock(c1, c1, indice_key="subm1d", norm=norm)
-        self.up1 = _UpBlock(c1, c0, indice_key="sp1", norm=norm)
-        self.dec0 = _SubMBlock(c0, c0, indice_key="subm0d", norm=norm)
+        self.up3 = _UpBlock(c3, c2, indice_key="sp3", norm=norm, algo=algo)
+        self.dec2 = _SubMBlock(c2, c2, indice_key="subm2d", norm=norm, algo=algo)
+        self.up2 = _UpBlock(c2, c1, indice_key="sp2", norm=norm, algo=algo)
+        self.dec1 = _SubMBlock(c1, c1, indice_key="subm1d", norm=norm, algo=algo)
+        self.up1 = _UpBlock(c1, c0, indice_key="sp1", norm=norm, algo=algo)
+        self.dec0 = _SubMBlock(c0, c0, indice_key="subm0d", norm=norm, algo=algo)
 
         # Per-site 1x1 classifier (submanifold) -> one logit per event site.
         self.head = spconv.SubMConv2d(c0, num_classes, kernel_size=1, bias=True,
-                                      indice_key="head")
+                                      indice_key="head", algo=algo)
 
     @staticmethod
     def _add(a, b):

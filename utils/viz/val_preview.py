@@ -43,6 +43,29 @@ def events_panel_from_voxel(voxel: torch.Tensor) -> np.ndarray:
     return img
 
 
+def events_panel_from_sites(coords: torch.Tensor, feats: torch.Tensor,
+                            h: int, w: int) -> np.ndarray:
+    """Sparse per-event sites → BGR panel: gray bg, red/blue per net polarity.
+
+    The event-native counterpart of :func:`events_panel_from_voxel`: instead of a
+    dense voxel grid, the active sites ``coords`` ``(M, 2)`` ``(x, y)`` are painted
+    onto a gray canvas, red where the site's mean signed polarity ``feats[:, 0]``
+    is positive and blue where negative. Visualizes exactly the sparse input the
+    EventSparseSeg model saw, so the panel and the prediction stay aligned.
+    """
+    img = np.full((h, w, 3), _GRAY, dtype=np.uint8)
+    if coords.numel() == 0:
+        return img
+    x = coords[:, 0].long().cpu().numpy()
+    y = coords[:, 1].long().cpu().numpy()
+    pol = feats[:, 0].detach().cpu().numpy()
+    in_b = (x >= 0) & (x < w) & (y >= 0) & (y < h)
+    x, y, pol = x[in_b], y[in_b], pol[in_b]
+    img[y[pol > 0], x[pol > 0]] = (0, 0, 255)   # BGR red  = positive polarity
+    img[y[pol < 0], x[pol < 0]] = (255, 0, 0)   # BGR blue = negative polarity
+    return img
+
+
 def mask_to_bgr(mask: np.ndarray, h: int, w: int) -> np.ndarray:
     """Binary/uint8 mask → 3-channel BGR, resized (nearest) to ``(h, w)``."""
     if mask.dtype != np.uint8:
@@ -65,29 +88,41 @@ def infer_fps(flir_t: Optional[np.ndarray], default: float = 30.0) -> float:
     return (n - 1) / duration if duration > 0 else default
 
 
-def write_triptych_video(
-    event_panels: Sequence[np.ndarray],
-    gt_masks: Sequence[np.ndarray],
-    pred_masks: Sequence[np.ndarray],
+def write_panels_video(
+    panel_seqs: Sequence[Sequence[np.ndarray]],
+    labels: Sequence[str],
     out_path: Path,
     fps: float = 30.0,
     title: str = "",
     per_frame_iou: Optional[Sequence[Optional[float]]] = None,
+    iou_panel: Optional[int] = None,
 ) -> None:
-    """Compose an Events | Teacher (GT) | Prediction MP4 with panel labels.
+    """Compose ``K`` labeled panels side by side into a single MP4.
 
-    All three sequences must be the same length and the panels the same H×W
-    (the GT/pred masks are uint8 0/255 single-channel; the event panels are
-    BGR). ``per_frame_iou`` (optional) is overlaid on the prediction panel.
+    ``panel_seqs`` is a list of ``K`` equal-length sequences; each frame element
+    is either a single-channel mask (uint8 0/255, converted with ``mask_to_bgr``)
+    or an already-BGR ``(H, W, 3)`` panel. ``labels`` gives the ``K`` panel
+    captions. When ``per_frame_iou`` and ``iou_panel`` are supplied, the IoU is
+    appended to ``labels[iou_panel]`` per frame. Panel geometry, the two-row
+    label strip, and the title/frame-counter are shared with the (now thin)
+    ``write_triptych_video`` wrapper.
     """
-    n = min(len(event_panels), len(gt_masks), len(pred_masks))
+    k = len(panel_seqs)
+    if k == 0:
+        return
+    n = min(len(s) for s in panel_seqs)
     if n == 0:
         return
-    h, w = event_panels[0].shape[:2]
+    h, w = panel_seqs[0][0].shape[:2]
 
     gap = 10
-    label_h = 40
-    out_w = w * 3 + 2 * gap
+    # Two stacked text rows under the panels: row 1 holds the per-panel labels,
+    # row 2 holds the long sequence title and the frame counter. Keeping them on
+    # separate rows is what stops the right-aligned title from being drawn on top
+    # of the panel labels.
+    row_h = 28
+    label_h = 2 * row_h
+    out_w = w * k + (k - 1) * gap
     out_h = h + label_h
     # Guard against a degenerate inferred fps (e.g. odd timestamp units) that
     # would write an unplayable file.
@@ -101,29 +136,56 @@ def write_triptych_video(
     font = cv2.FONT_HERSHEY_SIMPLEX
     try:
         for i in range(n):
-            gt_bgr = mask_to_bgr(gt_masks[i], h, w)
-            pred_bgr = mask_to_bgr(pred_masks[i], h, w)
-
             canvas = np.zeros((out_h, out_w, 3), dtype=np.uint8)
-            canvas[:h, :w] = event_panels[i]
-            canvas[:h, w + gap : 2 * w + gap] = gt_bgr
-            canvas[:h, 2 * w + 2 * gap : 3 * w + 2 * gap] = pred_bgr
+            row1_y = h + 22
+            for p in range(k):
+                frame = panel_seqs[p][i]
+                bgr = frame if frame.ndim == 3 else mask_to_bgr(frame, h, w)
+                x0 = p * (w + gap)
+                canvas[:h, x0 : x0 + w] = bgr
 
-            cv2.putText(canvas, "Events", (10, h + 28), font, 0.7,
-                        (255, 255, 255), 1, cv2.LINE_AA)
-            cv2.putText(canvas, "Teacher (GT)", (w + gap + 10, h + 28), font, 0.7,
-                        (255, 255, 255), 1, cv2.LINE_AA)
-            pred_label = "Prediction"
-            if per_frame_iou is not None and per_frame_iou[i] is not None:
-                pred_label = f"Prediction  IoU={per_frame_iou[i]:.2f}"
-            cv2.putText(canvas, pred_label, (2 * w + 2 * gap + 10, h + 28), font,
-                        0.7, (255, 255, 255), 1, cv2.LINE_AA)
+                label = labels[p]
+                if (iou_panel is not None and p == iou_panel
+                        and per_frame_iou is not None and per_frame_iou[i] is not None):
+                    label = f"{label}  IoU={per_frame_iou[i]:.2f}"
+                cv2.putText(canvas, label, (x0 + 10, row1_y), font, 0.7,
+                            (255, 255, 255), 1, cv2.LINE_AA)
 
-            meta = f"{title}  frame {i}/{n - 1}" if title else f"frame {i}/{n - 1}"
-            (tw, _), _ = cv2.getTextSize(meta, font, 0.55, 1)
-            cv2.putText(canvas, meta, (out_w - tw - 10, h + 28), font, 0.55,
+            # Row 2: sequence title (left) and frame counter (right), on their
+            # own row so the long title never overlaps the panel labels above.
+            row2_y = h + 22 + row_h
+            if title:
+                cv2.putText(canvas, title, (10, row2_y), font, 0.55,
+                            (200, 200, 200), 1, cv2.LINE_AA)
+            frame_meta = f"frame {i}/{n - 1}"
+            (tw, _), _ = cv2.getTextSize(frame_meta, font, 0.55, 1)
+            cv2.putText(canvas, frame_meta, (out_w - tw - 10, row2_y), font, 0.55,
                         (200, 200, 200), 1, cv2.LINE_AA)
 
             writer.write(canvas)
     finally:
         writer.release()
+
+
+def write_triptych_video(
+    event_panels: Sequence[np.ndarray],
+    gt_masks: Sequence[np.ndarray],
+    pred_masks: Sequence[np.ndarray],
+    out_path: Path,
+    fps: float = 30.0,
+    title: str = "",
+    per_frame_iou: Optional[Sequence[Optional[float]]] = None,
+) -> None:
+    """Compose an Events | Teacher (GT) | Prediction MP4 with panel labels.
+
+    Thin wrapper over ``write_panels_video``. All three sequences must be the
+    same length and the panels the same H×W (the GT/pred masks are uint8 0/255
+    single-channel; the event panels are BGR). ``per_frame_iou`` (optional) is
+    overlaid on the prediction panel.
+    """
+    write_panels_video(
+        [event_panels, gt_masks, pred_masks],
+        ["Events", "Teacher (GT)", "Prediction"],
+        out_path, fps=fps, title=title,
+        per_frame_iou=per_frame_iou, iou_panel=2,
+    )

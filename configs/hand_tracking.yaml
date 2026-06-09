@@ -41,8 +41,8 @@ DATA:
     class_name: HandEventClipDataset
     dataset_init_args:
       root_dir: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNew
-      voxel_bins: 5
-      window_ms: 36.0
+      voxel_bins: 10
+      window_ms: 18.0
       image_height: 240
       image_width: 320
       held_out_subject: tuxun       # LOSO held-out subject for val/test
@@ -86,7 +86,7 @@ MODEL:
   file_name: event_track_unet
   class_name: EventTrackUnet
   model_init_args:
-    in_channels: 5                  # = voxel_bins
+    in_channels: 10                 # = voxel_bins
     # Same backbone widths as the per-frame EventUnet (~0.65M) plus the ConvGRU
     # memory (~0.15M) → ~0.8M params total. Bump to [64,128,192,256] if mask
     # quality is capacity-limited.
@@ -136,7 +136,7 @@ SCHEDULER:
 
 LOGGER:
   log_dir_root: lightning_logs
-  experiment_name: hand_tracking_phaseB_eventtrackunet
+  experiment_name: hand_tracking_phaseB_eventtrackunet_10bins_18ms
 
 CHECKPOINT:
   enabled: True

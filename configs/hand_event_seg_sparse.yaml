@@ -28,10 +28,15 @@ TRAINING:
     pos_weight: 2.0
     focal_weight: 0.0
     dice_weight: 0.0
+  # One held-out preview video per rank at each validation epoch (Events |
+  # Teacher GT | Prediction), same as hand_tracking.yaml. Per-event predictions
+  # are rasterized to a dense mask for the prediction panel. With devices: 1 only
+  # one sequence renders; raise DISTRIBUTED.devices to render more.
+  val_preview_count: 4
 
 DISTRIBUTED:
   accelerator: gpu
-  devices: 1                  # single-GPU bring-up; raise after validation
+  devices: 4                  # single-GPU bring-up; raise after validation
   num_nodes: 1
   strategy: auto
 
@@ -70,6 +75,11 @@ MODEL:
     stage_channels: [16, 32, 48, 64]    # ~0.19M params (<=300K target)
     num_classes: 1
     norm: ln                            # LayerNorm over channels: LOSO-safe default
+    # spconv conv algorithm. "native" (gather + dense cuBLAS GEMM + scatter)
+    # avoids the implicit-GEMM SIGFPE seen when the spconv wheel's build-time CUDA
+    # is older than the torch runtime (cu120 wheel under cu128 torch). Once spconv
+    # is realigned with the CUDA runtime, set this to null for the faster default.
+    algo: null
 
 OPTIMIZER:
   name: AdamW
