@@ -1,24 +1,33 @@
-"""Per-event (sparse) variant of :class:`HandEventDataset`.
+"""Per-event (sparse, 3D) variant of :class:`HandEventDataset`.
 
-Instead of a dense voxel grid, each sample is the set of **active event sites** in
-the window centred on a FLIR frame, with a foreground/background label per site
-sampled from the cached SAM 2 teacher mask (``label = mask[y, x]``). This is the
-input/supervision for the event-native ``EventSparseSeg`` model.
+Instead of a dense voxel grid, each sample is the set of **individual events** in
+the window centred on a FLIR frame — every event keeps its own ``(x, y)``, time and
+polarity, with a foreground/background label per event sampled from the cached
+SAM 2 teacher mask. This is the input/supervision for the event-native 3D
+``EventSparseSeg`` model, which voxelizes ``(t, y, x)`` itself and emits one logit
+per event.
+
+Why per-event (not per-pixel-merged) any more
+---------------------------------------------
+The old version merged all events at a pixel into one 2D site, discarding the
+temporal axis before a 2D U-Net. At this sensor's ~1.2 events/pixel that bought
+almost no dedup while throwing away motion — the very signal that separates a
+moving hand from background. We now keep every event so the model can reason in 3D.
+
+The label
+---------
+``label = mask[y, x]`` is sampled from the cached SAM 2 mask at each event's pixel.
+These per-event labels are the direct supervision target for ``EventSparseSeg``
+(one logit per event), via ``loss/event_distillation.EventDistillationLoss``.
 
 Reuses the parent's subject-disjoint LOSO split, frame index, timestamp-unit
-detection, handle caching, and teacher-mask lookup unchanged; only ``__getitem__``
-differs. Geometric augmentation is intentionally disabled on this path (the
-parent's augmenter warps dense voxels/masks, not raw coordinates — coord-space
-augmentation is a Phase-2 addition).
+detection, handle caching, teacher-mask lookup, and event-coordinate rescaling
+unchanged; only ``__getitem__`` differs. Geometric augmentation is disabled on this
+path (the parent's augmenter warps dense voxels/masks, not raw coordinates).
 
 Per-sample output (consumed by ``collate_sparse_events``):
-    ``(coords[M, 2] long (x, y), feats[M, C] float, labels[M] float,
-       dense_mask[H, W] uint8, meta: dict)``
-
-Events sharing a pixel within the window are merged into one site (mean polarity,
-mean normalized time, log event count). Because the teacher mask is per-pixel,
-every event at a pixel shares the site's label; the true per-event stream output
-is recovered at inference by broadcasting the site logit to its events.
+    ``(coords[N, 2] long (x, y), feats[N, C] float, times[N] float,
+       labels[N] float, dense_mask[H, W] uint8, meta: dict)``
 """
 
 from __future__ import annotations
@@ -35,8 +44,8 @@ from data.sparse_event_collate import collate_sparse_events
 
 class HandEventStreamDataset(HandEventDataset):
 
-    #: signed polarity, normalized time-in-window, log1p(event count)
-    NUM_FEATURES = 3
+    #: per-event features: signed polarity, normalized time-in-window
+    NUM_FEATURES = 2
 
     def __init__(
         self,
@@ -90,14 +99,15 @@ class HandEventStreamDataset(HandEventDataset):
             return torch.from_numpy((mask_img > 127).astype(np.float32))
         return torch.zeros((H, W), dtype=torch.float32)
 
-    def _empty_sample(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _empty_sample(self):
         return (
             torch.zeros((0, 2), dtype=torch.long),
             torch.zeros((0, self.NUM_FEATURES), dtype=torch.float32),
             torch.zeros((0,), dtype=torch.float32),
+            torch.zeros((0,), dtype=torch.float32),
         )
 
-    def _build_sites(
+    def _build_events(
         self,
         t: np.ndarray,
         xy: np.ndarray,
@@ -105,15 +115,24 @@ class HandEventStreamDataset(HandEventDataset):
         t_start: float,
         t_end: float,
         mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Vectorized: raw events -> unique pixel sites with aggregated features + labels."""
+    ):
+        """Vectorized: raw events -> per-event (coords, feats, times, labels). No merge.
+
+        Event coordinates are rescaled to the configured ``(image_height,
+        image_width)`` the same way the parent voxel path rescales them, so events
+        and the (resized) teacher mask share one pixel grid.
+        """
         H, W = self.image_height, self.image_width
         if len(t) == 0:
             return self._empty_sample()
 
-        xy_t = torch.as_tensor(np.asarray(xy), dtype=torch.long)
-        x = xy_t[:, 0]
-        y = xy_t[:, 1]
+        xy_np = np.asarray(xy)
+        if self._needs_rescale and xy_np.size:
+            xy_np = xy_np.astype(np.float32)
+            xy_np[:, 0] = xy_np[:, 0] * self._scale_x
+            xy_np[:, 1] = xy_np[:, 1] * self._scale_y
+        x = torch.as_tensor(xy_np[:, 0]).floor().to(torch.long)
+        y = torch.as_tensor(xy_np[:, 1]).floor().to(torch.long)
         t_t = torch.as_tensor(np.asarray(t), dtype=torch.float64)
         p_t = torch.as_tensor(np.asarray(p), dtype=torch.float32)
         pol = torch.where(p_t > 0, torch.ones_like(p_t), -torch.ones_like(p_t))
@@ -134,24 +153,10 @@ class HandEventStreamDataset(HandEventDataset):
         denom = (t_end - t_start) if (t_end - t_start) > 0 else 1.0
         t_norm = ((t_t - t_start) / denom).clamp(0.0, 1.0).to(torch.float32)
 
-        # Merge duplicate pixels into unique sites (spconv wants unique coords).
-        lin = y * W + x
-        uniq, inverse = torch.unique(lin, sorted=True, return_inverse=True)
-        n_sites = uniq.numel()
-        ones = torch.ones_like(pol)
-        cnt = torch.zeros(n_sites, dtype=torch.float32).scatter_add_(0, inverse, ones)
-        pol_sum = torch.zeros(n_sites, dtype=torch.float32).scatter_add_(0, inverse, pol)
-        t_sum = torch.zeros(n_sites, dtype=torch.float32).scatter_add_(0, inverse, t_norm)
-        cnt_safe = cnt.clamp(min=1.0)
-
-        ux = (uniq % W).to(torch.long)
-        uy = (uniq // W).to(torch.long)
-        coords = torch.stack([ux, uy], dim=1)                       # (n_sites, 2) (x, y)
-        feats = torch.stack([pol_sum / cnt_safe,                    # mean polarity
-                             t_sum / cnt_safe,                      # mean time-in-window
-                             torch.log1p(cnt)], dim=1)              # log event count
-        labels = mask[uy, ux].to(torch.float32)                    # (n_sites,)
-        return coords, feats, labels
+        coords = torch.stack([x, y], dim=1)                         # (N, 2) (x, y)
+        feats = torch.stack([pol, t_norm], dim=1)                   # (N, 2) per event
+        labels = mask[y, x].to(torch.float32)                       # (N,)
+        return coords, feats, t_norm, labels
 
     # ------------------------------------------------------------------- sample
 
@@ -173,7 +178,7 @@ class HandEventStreamDataset(HandEventDataset):
         p = np.asarray(h["events_p"][lo:hi])
 
         mask = self._load_mask(h, f_idx)
-        coords, feats, labels = self._build_sites(t, xy, p, t_start, t_end, mask)
+        coords, feats, times, labels = self._build_events(t, xy, p, t_start, t_end, mask)
         dense_mask = (mask > 0.5).to(torch.uint8)
 
         meta = {
@@ -181,9 +186,9 @@ class HandEventStreamDataset(HandEventDataset):
             "frame_index": f_idx,
             "t_center": t_center,
             "n_events": int(hi - lo),
-            "n_sites": int(coords.shape[0]),
+            "n_kept": int(coords.shape[0]),
         }
-        return coords, feats, labels, dense_mask, meta
+        return coords, feats, times, labels, dense_mask, meta
 
     # ------------------------------------------------------------------ collate
 

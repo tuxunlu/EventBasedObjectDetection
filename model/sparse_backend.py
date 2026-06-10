@@ -83,3 +83,44 @@ def build_sparse_tensor(
         spatial_shape=[int(height), int(width)],
         batch_size=int(batch_size),
     )
+
+
+def build_sparse_tensor_3d(
+    coords_tyx: torch.Tensor,
+    feats: torch.Tensor,
+    batch_idx: torch.Tensor,
+    time_bins: int,
+    height: int,
+    width: int,
+    batch_size: int,
+):
+    """Assemble a 3D spconv ``SparseConvTensor`` over the ``(t, y, x)`` event volume.
+
+    The event stream is genuinely 3D: each occupied ``(t_bin, y, x)`` cell is one
+    active voxel. We use ``spatial_shape = [T, H, W]`` so the index columns are
+    ``[batch, t_bin, y, x]`` — the temporal axis is the *first* (slowest-strided)
+    spatial dim, which lets a downsampling ``SparseConv3d`` use an anisotropic
+    ``stride=(1, 2, 2)`` to grow the spatial receptive field while *preserving*
+    temporal resolution (the documented event-cloud pitfall is collapsing ``t``).
+
+    Parameters
+    ----------
+    coords_tyx : ``(M, 3)`` int tensor of ``(t_bin, y, x)`` per active voxel.
+    feats      : ``(M, C)`` float tensor of per-voxel features.
+    batch_idx  : ``(M,)`` int tensor mapping each voxel to its batch element.
+    time_bins, height, width : volume extent (``spatial_shape = [T, H, W]``).
+    batch_size : number of samples in the batch.
+
+    Returns an ``spconv.pytorch.SparseConvTensor`` on ``feats.device``.
+    """
+    spconv = require_spconv()
+    t = coords_tyx[:, 0]
+    y = coords_tyx[:, 1]
+    x = coords_tyx[:, 2]
+    indices = torch.stack([batch_idx, t, y, x], dim=1).to(torch.int32).contiguous()
+    return spconv.SparseConvTensor(
+        features=feats,
+        indices=indices,
+        spatial_shape=[int(time_bins), int(height), int(width)],
+        batch_size=int(batch_size),
+    )

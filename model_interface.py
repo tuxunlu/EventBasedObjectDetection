@@ -112,7 +112,10 @@ class ModelInterface(pl.LightningModule):
                 )
             self.loss_function = None  # not used in segmentation path
         elif self.task == "event_segmentation":
-            # Per-event sparse path: BCE (+optional focal/Dice) on per-site logits.
+            # Per-event sparse path: the model emits one logit per event, supervised
+            # directly against the per-event labels (label = mask[y,x]) that the
+            # dataloader provides. EventDistillationLoss is the noise/imbalance-aware
+            # per-event loss (SCE + per-sample Lovász-hinge + optional Focal-Tversky).
             event_cfg = dict(getattr(training_cfg, "event_loss_config", None) or {})
             self.event_loss = EventDistillationLoss(**event_cfg)
             self.seg_loss = None
@@ -364,29 +367,28 @@ class ModelInterface(pl.LightningModule):
         try:
             event_panels, gt_masks, pred_masks, ious = [], [], [], []
             for pos in positions:
-                coords, feats, labels, dense_mask, meta = val_set[pos]
+                coords, feats, times, labels, dense_mask, meta = val_set[pos]
                 batch = collate_sparse_events(
-                    [(coords, feats, labels, dense_mask, meta)]
+                    [(coords, feats, times, labels, dense_mask, meta)]
                 ).to(self.device)
-                logits = self(batch)                         # (N,) per-site logits
-
+                logits = self(batch)                         # (N,) per-event logits
                 h, w = batch.height, batch.width
+
                 raster = rasterize_events_to_logits(
                     batch.coords, logits.detach(), batch.batch_idx, 1, h, w,
                 )[0]                                          # (H, W) dense logits
                 pred = (torch.sigmoid(raster) > 0.5).float()
-
-                event_panels.append(events_panel_from_sites(coords, feats, h, w))
-                gt_np = (dense_mask.detach().cpu().numpy() > 0).astype("uint8") * 255
-                gt_masks.append(gt_np)
-                pred_masks.append((pred.cpu().numpy() * 255).astype("uint8"))
-                # Per-frame rasterized IoU, only where the GT has foreground.
                 if float(dense_mask.sum()) > 0:
                     ious.append(float(event_pred_to_dense_iou(
                         batch.coords, logits.detach(), batch.batch_idx,
                         batch.dense_mask, 1, h, w)))
                 else:
                     ious.append(None)
+
+                event_panels.append(events_panel_from_sites(coords, feats, h, w))
+                gt_np = (dense_mask.detach().cpu().numpy() > 0).astype("uint8") * 255
+                gt_masks.append(gt_np)
+                pred_masks.append((pred.cpu().numpy() * 255).astype("uint8"))
 
             seq_name = val_set.sequences[s_idx].name
             fps = self._infer_preview_fps(val_set, s_idx, infer_fps)
@@ -641,21 +643,21 @@ class ModelInterface(pl.LightningModule):
         return {'loss': loss, 'pred': logits, 'ground_truth': mask}
 
     def _event_segmentation_step(self, batch, stage):
-        """Per-event sparse path: ``SparseEventBatch`` -> per-site logits -> per-event loss.
+        """Per-event sparse path: ``SparseEventBatch`` -> one logit per event -> loss.
 
         ``batch`` is a ``SparseEventBatch`` (from ``data/sparse_event_collate.py``).
-        The model returns one logit per active event site, row-aligned to
-        ``batch.labels``. Empty windows (no events) are skipped by returning ``None``.
+        The model returns one logit per **event**, row-aligned to ``batch.labels``
+        (the per-event ``mask[y,x]`` target the dataloader provides). Empty windows
+        (no events) are skipped by returning ``None``.
         """
-        logits = self(batch)                 # (N,) per-site logits
+        logits = self(batch)                 # (N,) per-event logits
         labels = batch.labels
         if labels.numel() == 0:
             return None                      # nothing to supervise this batch
+        bs = batch.batch_size
 
         terms = self.event_loss(logits, labels, batch_idx=batch.batch_idx)
         loss = terms["total"]
-
-        bs = batch.batch_size
         self.log(f'{stage}_loss', loss, on_step=True, on_epoch=True,
                  prog_bar=True, sync_dist=True, batch_size=bs)
         self.log(f'{stage}_bce_loss', terms["bce"], on_step=True, on_epoch=True,
@@ -668,21 +670,15 @@ class ModelInterface(pl.LightningModule):
         self.log(f'{stage}_event_acc', acc, on_step=True, on_epoch=True,
                  prog_bar=False, sync_dist=True, batch_size=bs)
 
-        # Rasterized dense IoU: scatter per-event predictions to a dense mask and
-        # reuse binary_iou vs the teacher, so val_iou_epoch is directly comparable
-        # to the dense baseline. val/test only, to keep train steps lean.
+        # Rasterized dense IoU: scatter per-event predictions onto a dense grid and
+        # reuse binary_iou vs the teacher mask. val/test only, to keep train lean.
         if stage != "train":
             iou = event_pred_to_dense_iou(
                 batch.coords, logits.detach(), batch.batch_idx,
                 batch.dense_mask, bs, batch.height, batch.width,
             )
-            # on_step=True (with on_epoch=True) so Lightning emits the
-            # ``{stage}_iou_epoch`` key the ModelCheckpoint monitors — the
-            # ``_epoch`` suffix is only added when both flags are set. Matches the
-            # dense segmentation/tracking steps, keeping val_iou_epoch comparable.
             self.log(f'{stage}_iou', iou, on_step=True, on_epoch=True,
                      prog_bar=True, sync_dist=True, batch_size=bs)
-
         return {'loss': loss, 'pred': logits, 'ground_truth': labels}
 
     def __build_teacher(self, teacher_cfg):

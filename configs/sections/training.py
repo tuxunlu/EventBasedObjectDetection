@@ -53,6 +53,7 @@ class TrainingConfig(TrackedConfigMixin):
     # effect on the classification/segmentation tasks.
     temporal_consistency_weight: float = 0.0
     # Optional per-event loss config for task == "event_segmentation". Keys map to
-    # EventDistillationLoss.__init__ (bce_weight, pos_weight, focal_weight,
-    # focal_gamma, focal_alpha, dice_weight). None -> defaults (plain per-event BCE).
+    # EventDistillationLoss.__init__ (bce_weight, pos_weight, sce_beta, sce_alpha,
+    # lovasz_weight, tversky_weight, focal_weight, label_smoothing, ...).
+    # None -> defaults.
     event_loss_config: Optional[Dict[str, Any]] = None

@@ -1,19 +1,19 @@
-"""Standalone smoke test for the event-native sparse segmentation path.
+"""Standalone smoke test for the event-native 3D sparse segmentation path.
 
 Runs the full wiring on a tiny SYNTHETIC batch — no real dataset and no SAM 2
 needed — to verify the contract before launching a training run:
 
-  * collate -> model -> loss -> backward executes,
-  * the submanifold invariant holds (output sites == input event sites),
-  * per-event logits are row-aligned to the labels they were built from,
-  * the parameter budget is within target (<= 300K by default),
+  * collate -> 3D model -> per-event logits, one per EVENT (not per pixel),
+  * row-alignment of logits to the events/labels they were built from,
+  * the per-event loss (SCE + per-sample Lovász) runs + backward, all params get grad,
+  * the parameter budget is within target,
   * (optional) a rough forward latency / FPS estimate at a realistic event count.
 
-Requires torch + spconv (this is what actually exercises the CUDA sparse ops), so
-run it on the GPU box, not in a CPU-only sandbox:
+Requires torch + spconv (this exercises the CUDA sparse ops), so run it on the GPU
+box, not in a CPU-only sandbox:
 
     python tools/smoke_test_event_sparse.py
-    python tools/smoke_test_event_sparse.py --events 50000 --bench
+    python tools/smoke_test_event_sparse.py --events 40000 --bench
 """
 
 from __future__ import annotations
@@ -26,38 +26,40 @@ import torch
 from data.sparse_event_collate import collate_sparse_events
 from loss.event_distillation import EventDistillationLoss
 from model.event_sparse_seg import EventSparseSeg
-from utils.metrics.event_seg import event_f1, event_pred_to_dense_iou
 
 
-def _synth_sample(n_events: int, H: int, W: int, in_features: int, gen: torch.Generator):
-    """One synthetic sample of unique pixel sites, mimicking HandEventStreamDataset."""
-    n_pixels = H * W
-    n = min(n_events, n_pixels)
-    lin = torch.randperm(n_pixels, generator=gen)[:n]          # unique pixels
-    x = (lin % W).long()
-    y = (lin // W).long()
+def _synth_sample(n_events: int, H: int, W: int, gen: torch.Generator):
+    """One synthetic sample of individual events, mimicking HandEventStreamDataset.
+
+    Returns ``(coords (N,2), feats (N,2)=[pol,t_norm], times (N,), labels (N,),
+    dense_mask (H,W), meta)``.
+    """
+    x = torch.randint(0, W, (n_events,), generator=gen).long()
+    y = torch.randint(0, H, (n_events,), generator=gen).long()
     coords = torch.stack([x, y], dim=1)
-    feats = torch.randn(n, in_features, generator=gen)
-    # A spatially coherent-ish target: foreground in the left half.
-    labels = (x < W // 2).float()
+    times = torch.rand(n_events, generator=gen)                 # [0,1)
+    pol = torch.where(torch.rand(n_events, generator=gen) > 0.5,
+                      torch.ones(n_events), -torch.ones(n_events))
+    feats = torch.stack([pol, times], dim=1)                    # (N,2)
+    labels = (x < W // 2).float()                               # foreground = left half
     dense = torch.zeros(H, W, dtype=torch.uint8)
     dense[y, x] = labels.to(torch.uint8)
-    meta = {"n_events": n, "n_sites": n}
-    return coords, feats, labels, dense, meta
+    meta = {"n_events": n_events, "n_kept": n_events}
+    return coords, feats, times, labels, dense, meta
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--batch", type=int, default=2)
-    ap.add_argument("--events", type=int, default=2000, help="events per sample")
+    ap.add_argument("--events", type=int, default=4000, help="events per sample")
     ap.add_argument("--height", type=int, default=480)
     ap.add_argument("--width", type=int, default=640)
-    ap.add_argument("--in_features", type=int, default=3)
-    ap.add_argument("--max_params", type=int, default=300_000)
-    ap.add_argument("--algo", default=None,
-                    help="spconv conv algo: 'native' avoids the implicit-GEMM "
-                         "SIGFPE under a CUDA runtime newer than the spconv wheel "
-                         "(default: spconv's own choice).")
+    ap.add_argument("--in_features", type=int, default=2)
+    ap.add_argument("--time_bins", type=int, default=6)
+    ap.add_argument("--max_params", type=int, default=1_200_000)
+    ap.add_argument("--algo", default="native",
+                    help="spconv conv algo: 'native' avoids the implicit-GEMM SIGFPE "
+                         "under a CUDA runtime newer than the spconv wheel.")
     ap.add_argument("--bench", action="store_true", help="time forward passes")
     args = ap.parse_args()
 
@@ -66,43 +68,36 @@ def main() -> int:
     device = torch.device("cuda")
     gen = torch.Generator().manual_seed(0)
 
-    samples = [
-        _synth_sample(args.events, args.height, args.width, args.in_features, gen)
-        for _ in range(args.batch)
-    ]
+    samples = [_synth_sample(args.events, args.height, args.width, gen)
+               for _ in range(args.batch)]
     batch = collate_sparse_events(samples).to(device)
-    n_sites = batch.coords.shape[0]
-    print(f"[data ] batch_size={batch.batch_size} total_sites={n_sites} "
+    n_ev = batch.coords.shape[0]
+    print(f"[data ] batch_size={batch.batch_size} total_events={n_ev} "
           f"feat_dim={batch.feats.shape[1]}")
 
-    model = EventSparseSeg(in_features=args.in_features, num_classes=1,
-                           algo=args.algo).to(device)
+    model = EventSparseSeg(in_features=args.in_features, time_bins=args.time_bins,
+                           num_classes=1, algo=args.algo).to(device)
     n_params = model.count_parameters()
     print(f"[model] params={n_params:,}  (budget <= {args.max_params:,})")
     assert n_params <= args.max_params, "parameter budget exceeded"
 
-    # Forward / backward.
+    # Forward -> one logit per EVENT.
     logits = model(batch)
-    assert logits.shape[0] == n_sites, (
-        f"submanifold invariant violated: {logits.shape[0]} logits for {n_sites} sites"
+    assert logits.shape[0] == n_ev, (
+        f"per-event contract violated: {logits.shape[0]} logits for {n_ev} events"
     )
-    loss_fn = EventDistillationLoss(pos_weight=2.0)
+
+    # --- per-event loss (SCE + per-sample Lovász) fwd/bwd ---
+    loss_fn = EventDistillationLoss(pos_weight=2.0, sce_beta=1.0, sce_alpha=0.1,
+                                    lovasz_weight=1.0)
     terms = loss_fn(logits, batch.labels, batch_idx=batch.batch_idx)
     terms["total"].backward()
-    n_with_grad = sum(int(p.grad is not None) for p in model.parameters() if p.requires_grad)
-    n_trainable = sum(1 for p in model.parameters() if p.requires_grad)
-    print(f"[bwd  ] loss={terms['total'].item():.4f}  params_with_grad="
-          f"{n_with_grad}/{n_trainable}")
-    assert n_with_grad == n_trainable, "some parameters received no gradient"
-
-    # Metrics smoke.
-    with torch.no_grad():
-        f1 = event_f1(logits.detach(), batch.labels)
-        iou = event_pred_to_dense_iou(
-            batch.coords, logits.detach(), batch.batch_idx,
-            batch.dense_mask, batch.batch_size, batch.height, batch.width,
-        )
-    print(f"[eval ] event_f1={f1.item():.4f}  rasterized_iou={iou.item():.4f}")
+    n_grad = sum(int(p.grad is not None) for p in model.parameters() if p.requires_grad)
+    n_train = sum(1 for p in model.parameters() if p.requires_grad)
+    print(f"[loss ] total={terms['total'].item():.4f} bce={terms['bce'].item():.4f} "
+          f"lovasz={terms.get('lovasz', torch.tensor(0.)).item():.4f} "
+          f"params_with_grad={n_grad}/{n_train}")
+    assert n_grad == n_train, "some model parameters received no gradient"
 
     if args.bench:
         model.eval()

@@ -1,13 +1,19 @@
-# Event-native per-event segmentation (Phase 1).
+# Event-native 3D per-event segmentation.
 #
 # Differences vs configs/hand_segmentation.yaml (dense voxel U-Net):
 #   - TASK = event_segmentation -> ModelInterface routes to _event_segmentation_step,
-#     which consumes a SparseEventBatch and supervises one logit per event site.
-#   - DATA = HandEventStreamDataset -> yields deduplicated per-pixel event sites with
-#     per-site labels sampled from the cached SAM 2 teacher masks. Its `collate_fn`
+#     which consumes a SparseEventBatch and emits one logit per EVENT.
+#   - DATA = HandEventStreamDataset -> yields per-event (x,y), normalized time and
+#     polarity (NO per-pixel merge: the temporal axis is preserved). Its `collate_fn`
 #     staticmethod is auto-selected by DataInterface for ragged batching.
-#   - MODEL = EventSparseSeg -> submanifold sparse-conv U-Net (~0.19M params),
-#     output sites == input event sites.
+#   - MODEL = EventSparseSeg -> 3D submanifold sparse-conv U-Net over (t,y,x) + a
+#     per-event MLP head; output is one logit per input event (a true event stream).
+#
+# Supervision: each event is labeled directly from the cached SAM 2 mask
+# (label = mask[y,x]) and the per-event logits are supervised against those labels
+# with EventDistillationLoss (SCE + per-sample Lovász-hinge). The previous per-event
+# model scored ~0.10 IoU mainly because it collapsed the time axis into a 2D
+# pixel-merge; this rewrite keeps every event in 3D (t,y,x).
 #
 # Requires spconv v2 (see requirements.txt). Start single-GPU on L40S; scale
 # DISTRIBUTED.devices once the pipeline is validated.
@@ -19,15 +25,18 @@ TRAINING:
   seed: 42
   max_epochs: 50
   task: event_segmentation
-  # Per-event loss (EventDistillationLoss). Foreground (hand/arm) events are a
-  # minority of the stream, so a pos_weight > 1 counters the imbalance. Tune
-  # pos_weight to the observed fg:bg site ratio; enable focal_weight for stronger
-  # control if BCE alone collapses to background.
+  # Per-event loss (EventDistillationLoss) on the per-event labels (label=mask[y,x])
+  # the dataloader provides. SCE (sce_beta>0) is noise-robust against imperfect
+  # pseudo-masks; the per-sample Lovász-hinge is the class-imbalance lever (direct
+  # IoU surrogate). pos_weight upweights the minority foreground events. Enable
+  # tversky_weight (beta>alpha) if the mask under-covers the thin arm.
   event_loss_config:
     bce_weight: 1.0
     pos_weight: 2.0
-    focal_weight: 0.0
-    dice_weight: 0.0
+    sce_beta: 1.0
+    sce_alpha: 0.1
+    lovasz_weight: 1.0
+    tversky_weight: 0.0
   # One held-out preview video per rank at each validation epoch (Events |
   # Teacher GT | Prediction), same as hand_tracking.yaml. Per-event predictions
   # are rasterized to a dense mask for the prediction panel. With devices: 1 only
@@ -71,15 +80,17 @@ MODEL:
   file_name: event_sparse_seg
   class_name: EventSparseSeg
   model_init_args:
-    in_features: 3                      # = HandEventStreamDataset.NUM_FEATURES
-    stage_channels: [16, 32, 48, 64]    # ~0.19M params (<=300K target)
+    in_features: 2                      # = HandEventStreamDataset.NUM_FEATURES (pol, t_norm)
+    stage_channels: [24, 32, 48, 64]    # 3D submanifold U-Net widths
+    time_bins: 6                        # T temporal voxel bins (the 3rd spatial dim)
     num_classes: 1
+    head_hidden: 64                     # per-event MLP head width
     norm: ln                            # LayerNorm over channels: LOSO-safe default
     # spconv conv algorithm. "native" (gather + dense cuBLAS GEMM + scatter)
     # avoids the implicit-GEMM SIGFPE seen when the spconv wheel's build-time CUDA
     # is older than the torch runtime (cu120 wheel under cu128 torch). Once spconv
     # is realigned with the CUDA runtime, set this to null for the faster default.
-    algo: null
+    algo: native
 
 OPTIMIZER:
   name: AdamW
