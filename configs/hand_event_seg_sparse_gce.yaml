@@ -25,23 +25,22 @@ TRAINING:
   seed: 42
   max_epochs: 50
   task: event_segmentation
-  # Per-event loss (EventDistillationLoss) on the per-event labels (label=mask[y,x])
-  # the dataloader provides. SCE (sce_beta>0) is noise-robust against imperfect
-  # pseudo-masks; the per-sample Lovász-hinge is the class-imbalance lever (direct
-  # IoU surrogate). pos_weight upweights the minority foreground events. Enable
-  # tversky_weight (beta>alpha) if the mask under-covers the thin arm.
+  # LOSS VARIANT: GCE + Lovász. Generalized Cross-Entropy / L_q (Zhang & Sabuncu
+  # NeurIPS 2018) is the lowest-risk noise-robust pointwise term (one knob q
+  # interpolating CE<->MAE); a strict generalization of bare RCE. bce_weight=0 turns
+  # SCE off so GCE is the sole pointwise term; Lovász stays as the IoU/imbalance lever.
   event_loss_config:
-    bce_weight: 1.0
+    bce_weight: 0.0
     pos_weight: 2.0
-    sce_beta: 1.0
-    sce_alpha: 0.1
+    gce_weight: 1.0
+    gce_q: 0.7
+    gce_truncate: 0.0      # set ~0.3 to prune likely-mislabeled events (truncated-GCE)
     lovasz_weight: 1.0
-    tversky_weight: 0.0
   # One held-out preview video per rank at each validation epoch (Events |
   # Teacher GT | Prediction), same as hand_tracking.yaml. Per-event predictions
   # are rasterized to a dense mask for the prediction panel. With devices: 1 only
   # one sequence renders; raise DISTRIBUTED.devices to render more.
-  val_preview_count: 4
+  val_preview_count: 8
 
 DISTRIBUTED:
   accelerator: gpu
@@ -155,7 +154,7 @@ SCHEDULER:
 
 LOGGER:
   log_dir_root: lightning_logs
-  experiment_name: hand_event_seg_sparse
+  experiment_name: hand_event_seg_sparse_gce
 
 CHECKPOINT:
   enabled: True

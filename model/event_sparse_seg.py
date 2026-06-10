@@ -171,6 +171,12 @@ class EventSparseSeg(nn.Module):
         Output channels per event. ``1`` for a binary foreground logit.
     head_hidden
         Hidden width of the per-event MLP head. Default 64.
+    dropout
+        Dropout probability applied to (a) the per-event voxel-context feature
+        before the head and (b) inside the head MLP. The model otherwise has no
+        stochastic regularization, and the LOSO runs overfit the training subjects
+        within ~3 epochs — a non-zero dropout (try 0.1-0.3) directly targets that.
+        Default 0.0 (off).
     norm
         ``"ln"`` (default, LOSO-safe), ``"bn"``, or ``"none"``.
     algo
@@ -186,6 +192,7 @@ class EventSparseSeg(nn.Module):
         time_bins: int = 6,
         num_classes: int = 1,
         head_hidden: int = 64,
+        dropout: float = 0.0,
         norm: str = "ln",
         algo=None,
     ):
@@ -225,11 +232,15 @@ class EventSparseSeg(nn.Module):
 
         # Per-EVENT head: voxel context feature ⊕ the event's own raw features ->
         # MLP -> one logit per event. This is what makes the output a true
-        # per-event stream (distinct logits for events sharing a voxel).
+        # per-event stream (distinct logits for events sharing a voxel). Dropout
+        # (input + hidden) is the model's main regularizer against the fast LOSO
+        # overfitting; nn.Dropout(0.0) is a no-op so the default path is unchanged.
+        self.feat_drop = nn.Dropout(float(dropout))
         self.head = nn.Sequential(
             nn.Linear(c0 + self.in_features, head_hidden),
             nn.LayerNorm(head_hidden) if norm == "ln" else nn.Identity(),
             nn.ReLU(inplace=True),
+            nn.Dropout(float(dropout)),
             nn.Linear(head_hidden, num_classes),
         )
 
@@ -311,8 +322,9 @@ class EventSparseSeg(nn.Module):
         vox_out[torch.argsort(in_key)] = of[torch.argsort(out_key)]
 
         # Per-event head: gather each event's voxel context feature, concat the
-        # event's own raw features, MLP -> per-event logit.
-        ev_ctx = vox_out[inverse]                          # (N, c0)
+        # event's own raw features, MLP -> per-event logit. Dropout on the gathered
+        # context regularizes the backbone features (the raw event feats pass through).
+        ev_ctx = self.feat_drop(vox_out[inverse])          # (N, c0)
         logits = self.head(torch.cat([ev_ctx, feats], dim=1))   # (N, num_classes)
 
         if self.num_classes == 1:

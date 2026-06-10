@@ -66,6 +66,73 @@ def events_panel_from_sites(coords: torch.Tensor, feats: torch.Tensor,
     return img
 
 
+def _paint_sites(canvas: np.ndarray, x: np.ndarray, y: np.ndarray,
+                 color, r: int = 0) -> None:
+    """Paint events at ``(x, y)`` with ``color`` (optional 1-px dilation for visibility)."""
+    h, w = canvas.shape[:2]
+    canvas[y, x] = color
+    if r:
+        for dx in (-r, 0, r):
+            for dy in (-r, 0, r):
+                canvas[np.clip(y + dy, 0, h - 1), np.clip(x + dx, 0, w - 1)] = color
+
+
+def event_pred_triptych(
+    coords: torch.Tensor,
+    feats: torch.Tensor,
+    labels: torch.Tensor,
+    pred: torch.Tensor,
+    dense_mask: torch.Tensor,
+    h: int,
+    w: int,
+    tag: str = "",
+    f1: Optional[float] = None,
+) -> np.ndarray:
+    """Per-event 3-panel BGR frame (the val-preview analog of tools/viz_per_event_labels_video.py).
+
+    Panels, painted directly on the event sites (event-native, no rasterization):
+      1. **Prediction** — green where the model predicts foreground, gray where bg.
+      2. **GT label**   — green where ``label == 1`` (``mask[y,x]``), gray where bg.
+      3. **Context**    — events (gray) + the GT FLIR mask OUTLINE (yellow).
+
+    ``pred`` and ``labels`` are per-event ``(N,)`` in ``{0,1}``; ``dense_mask`` is the
+    ``(H, W)`` teacher mask used only for the outline in panel 3.
+    """
+    x = coords[:, 0].long().cpu().numpy()
+    y = coords[:, 1].long().cpu().numpy()
+    inb = (x >= 0) & (x < w) & (y >= 0) & (y < h)
+    x, y = x[inb], y[inb]
+    lab = (labels.detach().cpu().numpy()[inb] >= 0.5)
+    prd = (pred.detach().cpu().numpy()[inb] >= 0.5)
+    mask = (dense_mask.detach().cpu().numpy() > 0).astype(np.uint8)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    font, GREEN, GRAY, YELLOW, WHITE = cv2.FONT_HERSHEY_SIMPLEX, (0, 255, 0), (90, 90, 90), (0, 255, 255), (255, 255, 255)
+
+    p1 = np.zeros((h, w, 3), np.uint8)
+    _paint_sites(p1, x[~prd], y[~prd], GRAY)
+    _paint_sites(p1, x[prd], y[prd], GREEN, r=1)
+    head = f"prediction (green=fg {prd.mean() * 100:.1f}%)" if prd.size else "prediction (no events)"
+    if f1 is not None:
+        head += f"  F1={f1:.3f}"
+    cv2.putText(p1, head, (8, 22), font, 0.55, WHITE, 1, cv2.LINE_AA)
+
+    p2 = np.zeros((h, w, 3), np.uint8)
+    _paint_sites(p2, x[~lab], y[~lab], GRAY)
+    _paint_sites(p2, x[lab], y[lab], GREEN, r=1)
+    cv2.putText(p2, f"GT label (green=fg {lab.mean() * 100:.1f}%)" if lab.size else "GT label",
+                (8, 22), font, 0.55, WHITE, 1, cv2.LINE_AA)
+
+    p3 = np.zeros((h, w, 3), np.uint8)
+    _paint_sites(p3, x, y, (120, 120, 120))
+    cv2.drawContours(p3, contours, -1, YELLOW, 2)
+    cv2.putText(p3, "events (gray) + GT mask outline (yellow)", (8, 22), font, 0.55, WHITE, 1, cv2.LINE_AA)
+    if tag:
+        cv2.putText(p3, tag, (8, h - 12), font, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
+
+    sep = np.full((h, 4, 3), 255, np.uint8)
+    return np.concatenate([p1, sep, p2, sep, p3], axis=1)
+
+
 def mask_to_bgr(mask: np.ndarray, h: int, w: int) -> np.ndarray:
     """Binary/uint8 mask → 3-channel BGR, resized (nearest) to ``(h, w)``."""
     if mask.dtype != np.uint8:

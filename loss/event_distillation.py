@@ -23,6 +23,7 @@ structured label noise.
 
 from __future__ import annotations
 
+import math
 from typing import Dict, Optional
 
 import torch
@@ -83,7 +84,16 @@ def _lovasz_hinge_per_sample(logits, labels, batch_idx) -> torch.Tensor:
 class EventDistillationLoss(nn.Module):
     """Composable per-event mask-distillation loss (noise- and imbalance-aware).
 
-    ``L = ce_weight·CE_or_SCE  +  lovasz_weight·Lovász-hinge  +  tversky_weight·FocalTversky``
+    A weighted sum of opt-in terms — a *pointwise* noise term (SCE / GCE / GJS) + a
+    *set-level* imbalance term (Lovász-hinge / Focal-Tversky / NR-Dice / ASL):
+
+    ``L = bce_weight·(SCE or CE) + gce_weight·GCE + gjs_weight·GJS``
+    ``  + lovasz_weight·Lovász + nrdice_weight·NR-Dice + tversky_weight·FocalTversky``
+    ``  + asl_weight·ASL + focal_weight·Focal + dice_weight·Dice``
+
+    Set a term's weight to 0 to disable it. The four research terms (GCE, GJS,
+    NR-Dice, ASL) are wired to the ``hand_event_seg_sparse_{gce,gjs,gjs_nrdice,
+    gjs_asl}.yaml`` configs for separate A/B testing.
 
     Parameters
     ----------
@@ -108,6 +118,32 @@ class EventDistillationLoss(nn.Module):
         Legacy focal term, kept for back-compat (default off). Prefer SCE+Lovász.
     label_smoothing
         Soften hard targets toward ``0.5`` by this amount (cheap noise robustness).
+
+    Noise/imbalance research terms (each off by default; ``configs/
+    hand_event_seg_sparse_{gce,gjs,gjs_nrdice,gjs_asl}.yaml`` enable them):
+
+    gce_weight, gce_q, gce_truncate
+        Generalized Cross-Entropy / L_q (Zhang & Sabuncu, NeurIPS 2018):
+        ``(1 - p_t^q)/q``, ``q∈(0,1]`` interpolates CE(q→0)↔MAE(q=1). The
+        lowest-risk noise-robust pointwise term; a strict generalization of bare
+        RCE. ``gce_truncate=k>0`` clamps events with ``p_t<k`` to a constant
+        (zero-gradient) — prunes likely-mislabeled events (truncated-GCE).
+    gjs_weight, gjs_pi1
+        Generalized Jensen-Shannon divergence, M=2 (Englesson & Azizpour,
+        NeurIPS 2021): symmetric, bounded, *provably* interpolates CE↔MAE with one
+        knob ``π1`` (→1 = more MAE-like = more noise-robust). The strongest single
+        static noise-robust pointwise term; meant to *replace* the SCE block.
+    nrdice_weight, nrdice_gamma
+        Noise-Robust Dice (Wang et al., COPLE-Net, IEEE TMI 2020): a soft-Dice with
+        an MAE-analog numerator ``Σ|p-g|^γ`` (γ∈(1,2]; γ=2 = standard Dice, γ→1 =
+        max robustness). The only term that is overlap-based *and* noise-robust.
+        Per-sample over ``batch_idx``.
+    asl_weight, asl_gamma_pos, asl_gamma_neg, asl_clip
+        Asymmetric Loss (Ben-Baruch et al., ICCV 2021): decoupled +/- focusing with
+        a probability margin that hard-discards easy negatives. ``γ+=0`` never
+        suppresses the rare foreground; ``γ-`` focuses the background flood; the
+        ``asl_clip`` margin shifts/clamps negative probabilities. An imbalance lever
+        that, unlike plain focal, does not starve the rare class.
     """
 
     def __init__(
@@ -128,6 +164,17 @@ class EventDistillationLoss(nn.Module):
         dice_weight: float = 0.0,           # legacy alias for a global soft-dice
         label_smoothing: float = 0.0,
         ignore_negative: bool = True,
+        gce_weight: float = 0.0,
+        gce_q: float = 0.7,
+        gce_truncate: float = 0.0,
+        gjs_weight: float = 0.0,
+        gjs_pi1: float = 0.5,
+        nrdice_weight: float = 0.0,
+        nrdice_gamma: float = 1.5,
+        asl_weight: float = 0.0,
+        asl_gamma_pos: float = 0.0,
+        asl_gamma_neg: float = 4.0,
+        asl_clip: float = 0.05,
     ):
         super().__init__()
         self.bce_weight = float(bce_weight)
@@ -145,6 +192,17 @@ class EventDistillationLoss(nn.Module):
         self.dice_weight = float(dice_weight)
         self.label_smoothing = float(label_smoothing)
         self.ignore_negative = bool(ignore_negative)
+        self.gce_weight = float(gce_weight)
+        self.gce_q = float(gce_q)
+        self.gce_truncate = float(gce_truncate)
+        self.gjs_weight = float(gjs_weight)
+        self.gjs_pi1 = float(gjs_pi1)
+        self.nrdice_weight = float(nrdice_weight)
+        self.nrdice_gamma = float(nrdice_gamma)
+        self.asl_weight = float(asl_weight)
+        self.asl_gamma_pos = float(asl_gamma_pos)
+        self.asl_gamma_neg = float(asl_gamma_neg)
+        self.asl_clip = float(asl_clip)
         if pos_weight is not None:
             self.register_buffer("_pos_weight", torch.tensor(float(pos_weight)))
         else:
@@ -184,6 +242,70 @@ class EventDistillationLoss(nn.Module):
         inter = (p * labels).sum()
         return 1.0 - (2.0 * inter + eps) / (p.sum() + labels.sum() + eps)
 
+    def _posweight(self, per_event, labels):
+        """Apply the optional per-event class weight ``1+(pos_weight-1)·y`` and mean."""
+        if self._pos_weight is not None:
+            per_event = per_event * (1.0 + (self._pos_weight - 1.0) * labels)
+        return per_event.mean()
+
+    def _gce(self, logits, labels):
+        """Generalized Cross-Entropy / L_q (Zhang & Sabuncu, NeurIPS 2018)."""
+        eps = self.sce_clip
+        p = torch.sigmoid(logits)
+        p_t = (p * labels + (1.0 - p) * (1.0 - labels)).clamp_min(eps)
+        q = max(self.gce_q, 1e-3)
+        loss = (1.0 - p_t.pow(q)) / q
+        if self.gce_truncate > 0.0:
+            k = self.gce_truncate
+            const = (1.0 - k ** q) / q
+            loss = torch.where(p_t < k, torch.full_like(loss, const), loss)
+        return self._posweight(loss, labels)
+
+    def _gjs(self, logits, labels):
+        """Generalized Jensen-Shannon (M=2) noisy-label loss (Englesson NeurIPS 2021).
+
+        Interpolates CE↔MAE via ``pi1``; symmetric and bounded. For binary, the
+        2-class distributions are ``P=[1-p, p]`` and ``Y=[1-y, y]``.
+        """
+        eps = self.sce_clip
+        pi = min(max(self.gjs_pi1, 1e-3), 1.0 - 1e-3)
+        p = torch.sigmoid(logits).clamp(eps, 1.0 - eps)
+        P0, P1 = 1.0 - p, p
+        Y0, Y1 = 1.0 - labels, labels
+        m0 = (pi * Y0 + (1.0 - pi) * P0).clamp_min(eps)
+        m1 = (pi * Y1 + (1.0 - pi) * P1).clamp_min(eps)
+
+        def kl_y(Y, m):                          # Y·log(Y/m) with the 0·log0=0 rule
+            return torch.where(Y > 0, Y * torch.log(Y.clamp_min(eps) / m),
+                               torch.zeros_like(Y))
+        kl_Y = kl_y(Y0, m0) + kl_y(Y1, m1)
+        kl_P = P0 * torch.log(P0 / m0) + P1 * torch.log(P1 / m1)
+        Z = -(1.0 - pi) * math.log(1.0 - pi)
+        loss = (pi * kl_Y + (1.0 - pi) * kl_P) / Z
+        return self._posweight(loss, labels)
+
+    def _nr_dice(self, logits, labels, batch_idx, eps=1e-5):
+        """Noise-Robust Dice (Wang et al., COPLE-Net, IEEE TMI 2020), per sample."""
+        p = torch.sigmoid(logits)
+        num_e = (p - labels).abs().pow(self.nrdice_gamma)
+        den_e = p * p + labels * labels
+        if batch_idx is None:
+            return num_e.sum() / (den_e.sum() + eps)
+        B = int(batch_idx.max().item()) + 1
+        num = p.new_zeros(B).scatter_add_(0, batch_idx, num_e)
+        den = p.new_zeros(B).scatter_add_(0, batch_idx, den_e) + eps
+        present = torch.unique(batch_idx)
+        return (num[present] / den[present]).mean()
+
+    def _asl(self, logits, labels, eps=1e-6):
+        """Asymmetric Loss (Ben-Baruch et al., ICCV 2021); per-event independent binary."""
+        p = torch.sigmoid(logits)
+        l_pos = (1.0 - p).clamp_min(0.0).pow(self.asl_gamma_pos) * torch.log(p.clamp_min(eps))
+        p_m = (p - self.asl_clip).clamp_min(0.0)                  # probability-shifted neg
+        l_neg = p_m.pow(self.asl_gamma_neg) * torch.log((1.0 - p_m).clamp_min(eps))
+        loss = -(labels * l_pos + (1.0 - labels) * l_neg)
+        return loss.mean()
+
     # --------------------------------------------------------------- forward
     def forward(self, logits, labels, batch_idx=None) -> Dict[str, torch.Tensor]:
         logits = _flatten_logits(logits)
@@ -214,6 +336,24 @@ class EventDistillationLoss(nn.Module):
         else:
             pointwise = ce
         total = self.bce_weight * pointwise
+
+        # Noise-robust pointwise alternatives (each replaces the SCE block when its
+        # config sets bce_weight=0); see class docstring for the references.
+        if self.gce_weight > 0.0:
+            terms["gce"] = self._gce(logits, labels)
+            total = total + self.gce_weight * terms["gce"]
+
+        if self.gjs_weight > 0.0:
+            terms["gjs"] = self._gjs(logits, labels)
+            total = total + self.gjs_weight * terms["gjs"]
+
+        if self.nrdice_weight > 0.0:
+            terms["nrdice"] = self._nr_dice(logits, labels, batch_idx)
+            total = total + self.nrdice_weight * terms["nrdice"]
+
+        if self.asl_weight > 0.0:
+            terms["asl"] = self._asl(logits, labels)
+            total = total + self.asl_weight * terms["asl"]
 
         if self.lovasz_weight > 0.0:
             lov = _lovasz_hinge_per_sample(logits, labels, batch_idx)

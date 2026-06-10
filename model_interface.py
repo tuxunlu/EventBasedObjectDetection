@@ -332,24 +332,24 @@ class ModelInterface(pl.LightningModule):
     def _save_event_validation_previews(self, n: int):
         """Render this rank's held-out preview sequence for the sparse event path.
 
-        The event_segmentation analog of ``_save_validation_previews``: same
-        per-rank sequence selection and same Events | Teacher (GT) | Prediction
-        triptych, but each frame is the model's *sparse* per-event-site output.
-        For every frame the single-sample ``SparseEventBatch`` is run through the
-        model, the per-site logits are **rasterized to a dense (H, W) mask** (the
-        same scatter used for ``val_iou``), and the events panel is painted from
-        the active sites — so the panel, the prediction, and the logged IoU are
-        all built from exactly what the model saw and produced.
+        Per-event 3-panel video (the in-training analog of
+        ``tools/viz_per_event_labels_video.py``), painted directly on the event
+        sites — no rasterization:
+
+          1. **Prediction** — events green where the model predicts foreground.
+          2. **GT label**   — events green where ``label == 1`` (``mask[y,x]``).
+          3. **Context**    — events (gray) + the GT FLIR mask outline (yellow).
+
+        Each frame's title carries the per-event F1, so you can watch prediction vs
+        label converge over a held-out sequence frame by frame.
         """
         from pathlib import Path
 
+        import cv2
+
         from data.sparse_event_collate import collate_sparse_events
-        from utils.metrics.event_seg import (
-            event_pred_to_dense_iou, rasterize_events_to_logits,
-        )
-        from utils.viz.val_preview import (
-            events_panel_from_sites, infer_fps, write_triptych_video,
-        )
+        from utils.metrics.event_seg import event_f1
+        from utils.viz.val_preview import event_pred_triptych, infer_fps
 
         dm = getattr(self.trainer, "datamodule", None)
         val_set = getattr(dm, "validation_set", None) if dm is not None else None
@@ -361,45 +361,41 @@ class ModelInterface(pl.LightningModule):
         out_dir = Path(self.trainer.log_dir or ".") / "val_previews"
         out_dir.mkdir(parents=True, exist_ok=True)
         rank = int(getattr(self.trainer, "global_rank", 0) or 0)
+        seq_name = val_set.sequences[s_idx].name
+        fps = self._infer_preview_fps(val_set, s_idx, infer_fps)
+        out_path = out_dir / f"epoch{self.current_epoch:03d}_{seq_name}.mp4"
 
         was_training = self.model.training
         self.model.eval()
+        writer = None
         try:
-            event_panels, gt_masks, pred_masks, ious = [], [], [], []
-            for pos in positions:
+            for k, pos in enumerate(positions):
                 coords, feats, times, labels, dense_mask, meta = val_set[pos]
+                if coords.shape[0] == 0:
+                    continue
                 batch = collate_sparse_events(
                     [(coords, feats, times, labels, dense_mask, meta)]
                 ).to(self.device)
                 logits = self(batch)                         # (N,) per-event logits
                 h, w = batch.height, batch.width
+                pred = (torch.sigmoid(logits.detach()) > 0.5).float()
+                f1 = float(event_f1(logits.detach(), batch.labels)) if float(dense_mask.sum()) > 0 else None
 
-                raster = rasterize_events_to_logits(
-                    batch.coords, logits.detach(), batch.batch_idx, 1, h, w,
-                )[0]                                          # (H, W) dense logits
-                pred = (torch.sigmoid(raster) > 0.5).float()
-                if float(dense_mask.sum()) > 0:
-                    ious.append(float(event_pred_to_dense_iou(
-                        batch.coords, logits.detach(), batch.batch_idx,
-                        batch.dense_mask, 1, h, w)))
-                else:
-                    ious.append(None)
-
-                event_panels.append(events_panel_from_sites(coords, feats, h, w))
-                gt_np = (dense_mask.detach().cpu().numpy() > 0).astype("uint8") * 255
-                gt_masks.append(gt_np)
-                pred_masks.append((pred.cpu().numpy() * 255).astype("uint8"))
-
-            seq_name = val_set.sequences[s_idx].name
-            fps = self._infer_preview_fps(val_set, s_idx, infer_fps)
-            out_path = out_dir / f"epoch{self.current_epoch:03d}_{seq_name}.mp4"
-            write_triptych_video(
-                event_panels, gt_masks, pred_masks, out_path,
-                fps=fps, title=seq_name, per_frame_iou=ious,
-            )
-            print(f"[viz] rank{rank} wrote {out_path} ({len(positions)} frames, "
-                  f"{fps:.1f} fps)")
+                tag = f"{seq_name}  f{meta.get('frame_index', k):04d}  ({k + 1}/{len(positions)})"
+                frame = event_pred_triptych(coords, feats, labels, pred, dense_mask,
+                                            h, w, tag=tag, f1=f1)
+                if writer is None:
+                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                    writer = cv2.VideoWriter(str(out_path), fourcc, fps,
+                                             (frame.shape[1], frame.shape[0]))
+                writer.write(frame)
+            if writer is not None:
+                writer.release()
+                print(f"[viz] rank{rank} wrote {out_path} ({len(positions)} frames, "
+                      f"{fps:.1f} fps)")
         finally:
+            if writer is not None:
+                writer.release()
             if was_training:
                 self.model.train()
 
@@ -660,8 +656,13 @@ class ModelInterface(pl.LightningModule):
         loss = terms["total"]
         self.log(f'{stage}_loss', loss, on_step=True, on_epoch=True,
                  prog_bar=True, sync_dist=True, batch_size=bs)
-        self.log(f'{stage}_bce_loss', terms["bce"], on_step=True, on_epoch=True,
-                 prog_bar=False, sync_dist=True, batch_size=bs)
+        # Log every active sub-loss (bce/rce/gce/gjs/nrdice/asl/lovasz/...) so the
+        # ablation across configs is legible.
+        for name, value in terms.items():
+            if name == "total":
+                continue
+            self.log(f'{stage}_{name}_loss', value, on_step=True, on_epoch=True,
+                     prog_bar=False, sync_dist=True, batch_size=bs)
 
         f1 = event_f1(logits.detach(), labels)
         acc = event_accuracy(logits.detach(), labels)

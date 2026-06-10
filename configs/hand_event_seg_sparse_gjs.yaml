@@ -25,18 +25,16 @@ TRAINING:
   seed: 42
   max_epochs: 50
   task: event_segmentation
-  # Per-event loss (EventDistillationLoss) on the per-event labels (label=mask[y,x])
-  # the dataloader provides. SCE (sce_beta>0) is noise-robust against imperfect
-  # pseudo-masks; the per-sample Lovász-hinge is the class-imbalance lever (direct
-  # IoU surrogate). pos_weight upweights the minority foreground events. Enable
-  # tversky_weight (beta>alpha) if the mask under-covers the thin arm.
+  # LOSS VARIANT: GJS + Lovász. Generalized Jensen-Shannon divergence, M=2
+  # (Englesson & Azizpour NeurIPS 2021): symmetric, bounded, provably interpolates
+  # CE<->MAE with one knob pi1 (raise toward 0.7-0.9 if SAM2 noise is heavy). The
+  # strongest single static noise-robust pointwise term; replaces the SCE block.
   event_loss_config:
-    bce_weight: 1.0
+    bce_weight: 0.0
     pos_weight: 2.0
-    sce_beta: 1.0
-    sce_alpha: 0.1
+    gjs_weight: 1.0
+    gjs_pi1: 0.5
     lovasz_weight: 1.0
-    tversky_weight: 0.0
   # One held-out preview video per rank at each validation epoch (Events |
   # Teacher GT | Prediction), same as hand_tracking.yaml. Per-event predictions
   # are rasterized to a dense mask for the prediction panel. With devices: 1 only
@@ -155,7 +153,7 @@ SCHEDULER:
 
 LOGGER:
   log_dir_root: lightning_logs
-  experiment_name: hand_event_seg_sparse
+  experiment_name: hand_event_seg_sparse_gjs
 
 CHECKPOINT:
   enabled: True

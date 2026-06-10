@@ -38,6 +38,7 @@ import cv2
 import numpy as np
 import torch
 
+from data.event_augment import EventAugmentor
 from data.hand_event_dataset import HandEventDataset
 from data.sparse_event_collate import collate_sparse_events
 
@@ -59,9 +60,11 @@ class HandEventStreamDataset(HandEventDataset):
         action_only: bool = False,
         mask_root=None,
         max_events: int = 150000,
+        augmentation=None,
     ):
-        # voxel_bins is irrelevant on the event path; pass a harmless 1. Augmentation
-        # and RGB are disabled (see module docstring).
+        # voxel_bins is irrelevant on the event path; pass a harmless 1. The parent's
+        # dense voxel/mask augmenter is left OFF (augmentation=None below) — this path
+        # uses the event-native EventAugmentor instead (operates on raw events).
         super().__init__(
             root_dir=root_dir,
             purpose=purpose,
@@ -77,6 +80,10 @@ class HandEventStreamDataset(HandEventDataset):
             provide_rgb=False,
         )
         self.max_events = int(max_events)
+        # Event-native augmentation (train only). dict() defends against an OmegaConf
+        # node arriving from the YAML path (same guard as the parent augmenter).
+        self._augmentor = EventAugmentor(dict(augmentation) if augmentation else None)
+        self._event_aug_active = (purpose == "train" and self._augmentor.enabled)
 
     # ------------------------------------------------------------------ helpers
 
@@ -179,6 +186,16 @@ class HandEventStreamDataset(HandEventDataset):
 
         mask = self._load_mask(h, f_idx)
         coords, feats, times, labels = self._build_events(t, xy, p, t_start, t_end, mask)
+
+        if self._event_aug_active and coords.shape[0] > 0:
+            # Per-sample generator: idx mixes in the worker's running global RNG so
+            # the augmentation varies across epochs but is reproducible at a fixed
+            # global seed (mirrors the dense path's per-sample RNG derivation).
+            seed = (idx * 2654435761) ^ int(torch.randint(0, 2 ** 62, (1,)).item())
+            gen = torch.Generator().manual_seed(seed % (2 ** 63))
+            coords, feats, times, labels = self._augmentor(
+                coords, feats, times, labels, self.image_height, self.image_width, gen)
+
         dense_mask = (mask > 0.5).to(torch.uint8)
 
         meta = {

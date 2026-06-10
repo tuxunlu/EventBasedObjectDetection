@@ -25,18 +25,19 @@ TRAINING:
   seed: 42
   max_epochs: 50
   task: event_segmentation
-  # Per-event loss (EventDistillationLoss) on the per-event labels (label=mask[y,x])
-  # the dataloader provides. SCE (sce_beta>0) is noise-robust against imperfect
-  # pseudo-masks; the per-sample Lovász-hinge is the class-imbalance lever (direct
-  # IoU surrogate). pos_weight upweights the minority foreground events. Enable
-  # tversky_weight (beta>alpha) if the mask under-covers the thin arm.
+  # LOSS VARIANT: GJS + Lovász + ASL. Adds Asymmetric Loss (Ben-Baruch et al.,
+  # ICCV 2021) as an extra imbalance lever — decoupled +/- focusing with a margin
+  # that hard-discards easy background WITHOUT suppressing the rare foreground
+  # (asl_gamma_pos=0). Drop asl_gamma_neg toward 2-3 / asl_clip toward 0 if recall sags.
   event_loss_config:
-    bce_weight: 1.0
-    pos_weight: 2.0
-    sce_beta: 1.0
-    sce_alpha: 0.1
+    bce_weight: 0.0
+    gjs_weight: 1.0
+    gjs_pi1: 0.5
+    asl_weight: 1.0
+    asl_gamma_pos: 0.0
+    asl_gamma_neg: 4.0
+    asl_clip: 0.05
     lovasz_weight: 1.0
-    tversky_weight: 0.0
   # One held-out preview video per rank at each validation epoch (Events |
   # Teacher GT | Prediction), same as hand_tracking.yaml. Per-event predictions
   # are rasterized to a dense mask for the prediction panel. With devices: 1 only
@@ -155,7 +156,7 @@ SCHEDULER:
 
 LOGGER:
   log_dir_root: lightning_logs
-  experiment_name: hand_event_seg_sparse
+  experiment_name: hand_event_seg_sparse_gjs_asl
 
 CHECKPOINT:
   enabled: True
