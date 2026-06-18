@@ -57,3 +57,13 @@ class TrainingConfig(TrackedConfigMixin):
     # lovasz_weight, tversky_weight, focal_weight, label_smoothing, ...).
     # None -> defaults.
     event_loss_config: Optional[Dict[str, Any]] = None
+    # Optional per-event EVAL config for task == "event_segmentation". Controls the
+    # validation decision-threshold sweep and the spatial-coherence cleanup used for
+    # the *_iou_clean diagnostic. Recognized keys:
+    #   thr_min, thr_max, thr_steps    -> linspace of candidate thresholds (def .05/.95/19)
+    #   clean_enabled                  -> compute the cleaned IoU diagnostic (def True)
+    #   clean_open_ksize               -> morphological-open kernel size (def 3)
+    #   clean_keep_largest             -> keep only the largest connected blob (def False)
+    #   clean_min_area                 -> drop components smaller than this many px (def 0)
+    # None -> defaults.
+    event_eval_config: Optional[Dict[str, Any]] = None

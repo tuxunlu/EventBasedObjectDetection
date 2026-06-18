@@ -57,9 +57,19 @@ def main() -> int:
     ap.add_argument("--in_features", type=int, default=2)
     ap.add_argument("--time_bins", type=int, default=6)
     ap.add_argument("--max_params", type=int, default=1_200_000)
-    ap.add_argument("--algo", default="native",
+    ap.add_argument("--algo", default="implicit_gemm",
                     help="spconv conv algo: 'native' avoids the implicit-GEMM SIGFPE "
                          "under a CUDA runtime newer than the spconv wheel.")
+    ap.add_argument("--geom", action="store_true",
+                    help="enable EventSparseSeg.geom_features (+normalized x,y).")
+    ap.add_argument("--density", action="store_true",
+                    help="enable EventSparseSeg.density_features (+local density/timing).")
+    ap.add_argument("--recurrent", action="store_true",
+                    help="enable the bottleneck temporal GRU (EventSparseSeg.recurrent).")
+    ap.add_argument("--density_time_resolved", action="store_true",
+                    help="time-resolve the density features (per t_bin, anti-smear).")
+    ap.add_argument("--temporal_interp_head", action="store_true",
+                    help="interpolate per-event head context across adjacent t_bins.")
     ap.add_argument("--bench", action="store_true", help="time forward passes")
     args = ap.parse_args()
 
@@ -76,7 +86,15 @@ def main() -> int:
           f"feat_dim={batch.feats.shape[1]}")
 
     model = EventSparseSeg(in_features=args.in_features, time_bins=args.time_bins,
-                           num_classes=1, algo=args.algo).to(device)
+                           num_classes=1, algo=args.algo,
+                           geom_features=args.geom, density_features=args.density,
+                           density_time_resolved=args.density_time_resolved,
+                           temporal_interp_head=args.temporal_interp_head,
+                           recurrent=args.recurrent).to(device)
+    print(f"[model] geom_features={args.geom} density_features={args.density} "
+          f"density_time_resolved={args.density_time_resolved} "
+          f"temporal_interp_head={args.temporal_interp_head} "
+          f"recurrent={args.recurrent} n_extra={model.n_extra}")
     n_params = model.count_parameters()
     print(f"[model] params={n_params:,}  (budget <= {args.max_params:,})")
     assert n_params <= args.max_params, "parameter budget exceeded"

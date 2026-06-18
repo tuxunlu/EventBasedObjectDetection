@@ -1,0 +1,182 @@
+# Event-native 3D per-event segmentation — v2 + temporal anti-smear.
+#
+# Targets the residual failure of v2: the model isolates static background (moving
+# checkerboard) but strings FALSE POSITIVES along the hand/arm trajectories. That
+# "trajectory wake" is the signature of TEMPORAL MOTION SMEAR, not a global-context
+# deficit — a moving edge integrated over a coarse time bin paints a comet tail, and
+# at t_bin resolution the instantaneous edge and the swath it merely swept through
+# collapse into one space-time blob, so static-source events inside the tube inherit
+# the hand's foreground-leaning context.
+#
+# Three temporal-resolution levers (vs. v2), no pooling/attention added:
+#   1. time_bins 10 -> 14  — sharpen the space-time tube so the wake separates from
+#      the instantaneous edge. Cost ~ #active voxels (≈ #events), so nearly free.
+#   2. density_time_resolved: True — accumulate the density/timing features WITHIN
+#      each t_bin instead of collapsing over all t at a pixel, so a trajectory pixel's
+#      static-source burst (a different instant) no longer reads as hand-like density.
+#   3. temporal_interp_head: True — the per-event head reads context interpolated
+#      between adjacent t_bins by the event's fractional time, so two co-pixel events
+#      at different sub-bin moments get different context.
+# The bottleneck GRU is OFF: a full-T recurrent sweep smears foreground evidence
+# across every time bin of a column the hand passes through — a foreground-along-time
+# leak at exactly the trajectory columns (the wake). Re-enable only causally if needed.
+#
+# Confirm the mechanism first: pull FP events and compare their timestamps to the true
+# hand events at the same/nearby pixels — if FPs cluster at a DIFFERENT time than the
+# hand passage, temporal leakage is confirmed.
+
+TRAINING:
+  deterministic: False
+  use_compile: False
+  inference_mode: False
+  seed: 42
+  max_epochs: 50
+  task: event_segmentation
+  # GJS (noise-robust pointwise) + Lovász (IoU surrogate), rebalanced toward precision:
+  # pos_weight 1.0 and a Focal-Tversky term with alpha>beta (penalize FALSE POSITIVES
+  # harder than false negatives) directly attacks the other-motion leakage.
+  event_loss_config:
+    bce_weight: 0.0
+    pos_weight: 1.0
+    gjs_weight: 1.0
+    gjs_pi1: 0.5
+    lovasz_weight: 1.0
+    tversky_weight: 0.5
+    tversky_alpha: 0.7        # FP weight  (> beta => favor precision)
+    tversky_beta: 0.3         # FN weight
+    tversky_gamma: 1.0
+  # Decision-threshold sweep + spatial-coherence cleanup diagnostics (Tier 3).
+  event_eval_config:
+    thr_min: 0.05
+    thr_max: 0.95
+    thr_steps: 19
+    clean_enabled: True
+    clean_open_ksize: 3       # morphological open: drops 1-px speckle
+    clean_keep_largest: False # set True to keep only the hand+arm blob
+    clean_min_area: 0
+  val_preview_count: 4
+
+DISTRIBUTED:
+  accelerator: gpu
+  devices: 4
+  num_nodes: 1
+  strategy: auto
+
+DATA:
+  dataset:
+    file_name: hand_event_stream_dataset
+    class_name: HandEventStreamDataset
+    dataset_init_args:
+      root_dir: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNew
+      window_ms: 30.0                   # TIER 2: mild shrink (was 36) -> mask more valid across window
+      image_height: 480
+      image_width: 640
+      held_out_subject: tuxun
+      require_teacher: True
+      action_only: False
+      mask_root: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNewTeacherMasks
+      max_events: 150000
+      # TIER 2: train-only label refinement (ignored events -> label -1 -> dropped
+      # by EventDistillationLoss). val/test keep clean {0,1} labels for honest F1/IoU.
+      boundary_ignore_px: 3             # trimap: ignore events in a 3-px band at the mask edge
+      time_ignore_frac: 0.10            # ignore events in the first/last 10% of the window
+      augmentation:
+        enabled: True
+        hflip_prob: 0.5
+        affine_prob: 0.5
+        rotate_deg: 15.0
+        scale_range: [0.85, 1.20]
+        translate_frac: 0.10
+        event_drop_prob: 0.5
+        event_drop_frac: [0.0, 0.5]
+        upsample_prob: 0.3
+        upsample_range: [1.0, 1.5]
+        vflip_prob: 0.0
+        jitter_px: 1.0
+        area_drop_prob: 0.25
+        area_drop_frac: 0.20
+        time_crop_prob: 0.25
+        time_crop_min: 0.7
+        time_reverse_prob: 0.2
+        polarity_flip_prob: 0.1
+        time_jitter: 0.01
+        noise_frac: 0.05
+        min_events: 64
+      num_classes: 1
+  dataloader:
+    batch_size: 8
+    test_batch_size: 8
+    num_workers: 8
+    persistent_workers: True
+    pin_memory: True
+    multiprocessing_context: fork
+    drop_last: True
+    shuffle_train: True
+    shuffle_val: False
+    shuffle_test: False
+
+MODEL:
+  file_name: event_sparse_seg
+  class_name: EventSparseSeg
+  model_init_args:
+    in_features: 2                      # dataset feats (pol, t_norm); extra channels are synthesized in-model
+    stage_channels: [24, 32, 48, 64]
+    time_bins: 14                       # ANTI-SMEAR (1): finer space-time tube (was 10); 30ms/14 ≈ 2.1ms bins
+    num_classes: 1
+    head_hidden: 64
+    dropout: 0.2
+    norm: ln
+    algo: native
+    # TIER 1: enrich the 2-channel (polarity, time) input with geometry + motion.
+    geom_features: True                 # + normalized (x, y)
+    density_features: True              # + log local density, neighborhood time mean/std
+    density_radius: 2                   # 5x5 neighborhood for the density/timing features
+    # ANTI-SMEAR (2): density/timing accumulated WITHIN each t_bin, not collapsed over t.
+    density_time_resolved: True
+    # ANTI-SMEAR (3): per-event head reads context interpolated across adjacent t_bins.
+    temporal_interp_head: True
+    # Bottleneck GRU OFF: full-T recurrent sweep smears foreground along the wake columns.
+    recurrent: False
+
+OPTIMIZER:
+  name: AdamW
+  arguments:
+    lr: 3e-4
+    weight_decay: 1e-4
+  gradient_accumulation:
+    enabled: False
+    scheduling: {0: 4, 4: 2, 8: 1}
+  gradient_clip:
+    enabled: True
+    gradient_clip_val: 1.0
+    gradient_clip_algorithm: norm
+  stochastic_weight_averaging:
+    enabled: False
+    swa_lrs: 1e-2
+
+SCHEDULER:
+  learning_rate:
+    enabled: True
+    name: CosineAnnealingLR
+    arguments:
+      T_max: 50
+      eta_min: 1e-6
+  early_stopping:
+    enabled: False
+    monitor: val_loss_epoch
+    mode: min
+    patience: 5
+    min_delta: 1e-5
+
+LOGGER:
+  log_dir_root: lightning_logs
+  experiment_name: hand_event_seg_sparse_gjs_v2_antismear
+
+CHECKPOINT:
+  enabled: True
+  every_n_epochs: 1
+  monitor: val_event_f1_epoch
+  mode: max
+  filename: "best-{epoch:03d}-{val_event_f1_epoch:.4f}"
+  save_top_k: 1
+  save_last: True

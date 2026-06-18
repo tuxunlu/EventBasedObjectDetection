@@ -13,7 +13,11 @@ from torchmetrics.functional.classification import multiclass_accuracy
 from utils.metrics.segmentation import (
     binary_iou, binary_dice, boundary_f_score,
 )
-from utils.metrics.event_seg import event_f1, event_accuracy, event_pred_to_dense_iou
+from utils.metrics.event_seg import (
+    event_f1, event_accuracy, event_precision, event_recall,
+    event_pred_to_dense_iou, event_pred_to_dense_iou_clean,
+    sweep_counts, f1_from_counts,
+)
 from configs.sections import (
     ModelConfig,
     OptimizerConfig,
@@ -120,6 +124,22 @@ class ModelInterface(pl.LightningModule):
             self.event_loss = EventDistillationLoss(**event_cfg)
             self.seg_loss = None
             self.loss_function = None
+            # Tier-3 decision rebalancing. The fixed-0.5 cut over-predicts foreground
+            # (pred 11.6% vs GT 9.9%); we sweep the threshold on val each epoch and
+            # report the best-F1 operating point + a spatial-coherence-cleaned IoU.
+            eval_cfg = dict(getattr(training_cfg, "event_eval_config", None) or {})
+            lo = float(eval_cfg.get("thr_min", 0.05))
+            hi = float(eval_cfg.get("thr_max", 0.95))
+            steps = int(eval_cfg.get("thr_steps", 19))
+            self._cal_thresholds = torch.linspace(lo, hi, max(2, steps))
+            self._cal_threshold = 0.5                  # calibrated operating point
+            self._cal_tp = self._cal_fp = self._cal_fn = None
+            # Post-hoc spatial cleanup applied to the rasterized prediction for the
+            # *_iou_clean diagnostic (and reused at inference). off by default.
+            self._clean_open_ksize = int(eval_cfg.get("clean_open_ksize", 3))
+            self._clean_keep_largest = bool(eval_cfg.get("clean_keep_largest", False))
+            self._clean_min_area = int(eval_cfg.get("clean_min_area", 0))
+            self._clean_enabled = bool(eval_cfg.get("clean_enabled", True))
         else:
             self.loss_function = self.__configure_loss()
 
@@ -158,6 +178,41 @@ class ModelInterface(pl.LightningModule):
     def on_train_epoch_end(self):
         pass
 
+    def on_validation_epoch_start(self):
+        # Reset the per-threshold calibration accumulators for the event task.
+        if self.task == "event_segmentation":
+            self._cal_tp = self._cal_fp = self._cal_fn = None
+
+    def _calibrate_event_threshold(self):
+        """Pick the best-F1 decision threshold from the val-epoch count sweep.
+
+        Aggregates the per-threshold ``(tp, fp, fn)`` accumulated across the epoch
+        (and across DDP ranks), logs the best F1 and its threshold, and stores the
+        operating point on ``self._cal_threshold`` for the preview renderer / export.
+        """
+        if self._cal_tp is None:
+            return
+        tp, fp, fn = self._cal_tp, self._cal_fp, self._cal_fn
+        # Sum the counts across ranks so the calibration uses the whole val set.
+        # all_gather adds a leading world dim; only reduce when actually distributed
+        # (in single-process it would otherwise collapse the threshold axis).
+        ws = int(getattr(self.trainer, "world_size", 1) or 1)
+        if ws > 1:
+            try:
+                tp = self.all_gather(tp).sum(dim=0)
+                fp = self.all_gather(fp).sum(dim=0)
+                fn = self.all_gather(fn).sum(dim=0)
+            except Exception:  # noqa: BLE001 - no strategy / not initialized
+                pass
+        f1s = f1_from_counts(tp, fp, fn)
+        best = int(torch.argmax(f1s).item())
+        self._cal_threshold = float(self._cal_thresholds[best].item())
+        bs = 1
+        self.log("val_event_f1_best", f1s[best], on_step=False, on_epoch=True,
+                 prog_bar=True, sync_dist=False, batch_size=bs)
+        self.log("val_event_thr", torch.tensor(self._cal_threshold),
+                 on_step=False, on_epoch=True, prog_bar=False, sync_dist=False, batch_size=bs)
+
     def on_validation_epoch_end(self):
         """Render one held-out preview video per rank (segmentation/tracking).
 
@@ -183,6 +238,12 @@ class ModelInterface(pl.LightningModule):
         """
         if self.task not in ("segmentation", "tracking", "event_segmentation"):
             return
+        # Threshold calibration runs first and unconditionally for the event task
+        # (it is a collective via all_gather, so every rank must reach it together,
+        # and it must not depend on the preview count).
+        if self.task == "event_segmentation" \
+                and not getattr(self.trainer, "sanity_checking", False):
+            self._calibrate_event_threshold()
         n = int(getattr(self.training_cfg, "val_preview_count", 0) or 0)
         if n <= 0:
             return
@@ -378,8 +439,10 @@ class ModelInterface(pl.LightningModule):
                 ).to(self.device)
                 logits = self(batch)                         # (N,) per-event logits
                 h, w = batch.height, batch.width
-                pred = (torch.sigmoid(logits.detach()) > 0.5).float()
-                f1 = float(event_f1(logits.detach(), batch.labels)) if float(dense_mask.sum()) > 0 else None
+                thr = float(getattr(self, "_cal_threshold", 0.5))
+                pred = (torch.sigmoid(logits.detach()) > thr).float()
+                f1 = float(event_f1(logits.detach(), batch.labels, threshold=thr)) \
+                    if float(dense_mask.sum()) > 0 else None
 
                 tag = f"{seq_name}  f{meta.get('frame_index', k):04d}  ({k + 1}/{len(positions)})"
                 frame = event_pred_triptych(coords, feats, labels, pred, dense_mask,
@@ -664,22 +727,52 @@ class ModelInterface(pl.LightningModule):
             self.log(f'{stage}_{name}_loss', value, on_step=True, on_epoch=True,
                      prog_bar=False, sync_dist=True, batch_size=bs)
 
-        f1 = event_f1(logits.detach(), labels)
-        acc = event_accuracy(logits.detach(), labels)
+        det = logits.detach()
+        f1 = event_f1(det, labels)
+        acc = event_accuracy(det, labels)
         self.log(f'{stage}_event_f1', f1, on_step=True, on_epoch=True,
                  prog_bar=True, sync_dist=True, batch_size=bs)
         self.log(f'{stage}_event_acc', acc, on_step=True, on_epoch=True,
                  prog_bar=False, sync_dist=True, batch_size=bs)
+        # Precision / recall separately so the false-positive flood (the symptom:
+        # other-motion events leaking into the hand class) is directly visible, not
+        # hidden inside F1. The trimap-ignored (label<0) events are dropped by the
+        # metric's count helper.
+        self.log(f'{stage}_event_precision', event_precision(det, labels),
+                 on_step=False, on_epoch=True, prog_bar=False, sync_dist=True, batch_size=bs)
+        self.log(f'{stage}_event_recall', event_recall(det, labels),
+                 on_step=False, on_epoch=True, prog_bar=False, sync_dist=True, batch_size=bs)
+
+        # Accumulate the per-threshold counts over the val epoch for post-hoc
+        # threshold calibration (computed in on_validation_epoch_end).
+        if stage == "val":
+            tp, fp, fn = sweep_counts(det, labels, self._cal_thresholds)
+            if self._cal_tp is None:
+                self._cal_tp = tp.clone(); self._cal_fp = fp.clone(); self._cal_fn = fn.clone()
+            else:
+                self._cal_tp += tp; self._cal_fp += fp; self._cal_fn += fn
 
         # Rasterized dense IoU: scatter per-event predictions onto a dense grid and
         # reuse binary_iou vs the teacher mask. val/test only, to keep train lean.
         if stage != "train":
             iou = event_pred_to_dense_iou(
-                batch.coords, logits.detach(), batch.batch_idx,
+                batch.coords, det, batch.batch_idx,
                 batch.dense_mask, bs, batch.height, batch.width,
             )
             self.log(f'{stage}_iou', iou, on_step=True, on_epoch=True,
                      prog_bar=True, sync_dist=True, batch_size=bs)
+            # Spatial-coherence-cleaned IoU: removes isolated FP speckle from the
+            # rasterized prediction. The gap vs val_iou quantifies how much of the
+            # error is incoherent noise the cleanup can remove for free at inference.
+            if self._clean_enabled:
+                iou_clean = event_pred_to_dense_iou_clean(
+                    batch.coords, det, batch.batch_idx,
+                    batch.dense_mask, bs, batch.height, batch.width,
+                    threshold=0.5, open_ksize=self._clean_open_ksize,
+                    keep_largest=self._clean_keep_largest, min_area=self._clean_min_area,
+                )
+                self.log(f'{stage}_iou_clean', iou_clean, on_step=False, on_epoch=True,
+                         prog_bar=False, sync_dist=True, batch_size=bs)
         return {'loss': loss, 'pred': logits, 'ground_truth': labels}
 
     def __build_teacher(self, teacher_cfg):
@@ -735,19 +828,34 @@ class ModelInterface(pl.LightningModule):
     @staticmethod
     def filter_init_args(cls, config_dict):
         """
-        Checks if config_dict has all required arguments for cls.__init__
+        Build the init kwargs for ``cls`` from ``config_dict``.
+
+        A parameter is pulled from the config when present. Parameters that have a
+        default are optional (their default is used when the config omits them) so
+        that adding a new defaulted ``__init__`` arg to a model/dataset does NOT
+        require every pre-existing config to list it. Only parameters WITHOUT a
+        default are required, and ``self`` / ``*args`` / ``**kwargs`` are skipped.
         """
         init_args = dict()
-        for name in inspect.signature(cls.__init__).parameters.keys():
-            # Skip 'self', '*args', '**kwargs' and parameters with defaults
-            if name not in ('self'):
+        missing_required = []
+        for name, param in inspect.signature(cls.__init__).parameters.items():
+            if name == "self":
+                continue
+            if param.kind in (inspect.Parameter.VAR_POSITIONAL,
+                              inspect.Parameter.VAR_KEYWORD):
+                continue
+            if name in config_dict:
                 init_args[name] = config_dict[name]
-        provided_keys = set(config_dict.keys())
-        missing_keys = init_args.keys() - provided_keys
-        
-        if missing_keys:
-            raise ValueError(f"In dataset initialization, found missing config keys for {cls.__name__}: {missing_keys}")
-        
+            elif param.default is inspect.Parameter.empty:
+                missing_required.append(name)
+            # else: defaulted and not provided -> let cls use its own default.
+
+        if missing_required:
+            raise ValueError(
+                f"In {cls.__name__} initialization, found missing required config "
+                f"keys: {missing_required}"
+            )
+
         return init_args
 
     def __load_model(self):

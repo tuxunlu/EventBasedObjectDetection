@@ -61,6 +61,8 @@ class HandEventStreamDataset(HandEventDataset):
         mask_root=None,
         max_events: int = 150000,
         augmentation=None,
+        boundary_ignore_px: int = 0,
+        time_ignore_frac: float = 0.0,
     ):
         # voxel_bins is irrelevant on the event path; pass a harmless 1. The parent's
         # dense voxel/mask augmenter is left OFF (augmentation=None below) — this path
@@ -85,6 +87,26 @@ class HandEventStreamDataset(HandEventDataset):
         self._augmentor = EventAugmentor(dict(augmentation) if augmentation else None)
         self._event_aug_active = (purpose == "train" and self._augmentor.enabled)
 
+        # --- Tier-2 supervision cleanup (TRAIN ONLY) ------------------------------
+        # The per-event label is sampled from a SINGLE FLIR-frame SAM 2 mask, but the
+        # event window spans ``window_ms`` during which the hand moves. Two sources of
+        # structured label noise follow, both of which teach a dilated/fuzzy boundary:
+        #   * boundary_ignore_px: the mask edge is the least trustworthy region (a
+        #     few px of motion smear + teacher slop). Events in a morphological band
+        #     of this half-width around the mask edge are marked label = -1 ("ignore"),
+        #     which EventDistillationLoss drops (ignore_negative).
+        #   * time_ignore_frac: events far from the window centre (where the mask was
+        #     captured) are the most spatially misaligned with it. Events in the first
+        #     / last ``time_ignore_frac`` of the normalized window are marked -1.
+        # Applied to the supervision target only; val/test keep clean {0,1} labels so
+        # the logged F1/IoU stay honest, and ``dense_mask`` is always the clean mask.
+        self.boundary_ignore_px = int(boundary_ignore_px)
+        self.time_ignore_frac = float(time_ignore_frac)
+        self._label_refine_active = (
+            purpose == "train"
+            and (self.boundary_ignore_px > 0 or self.time_ignore_frac > 0.0)
+        )
+
     # ------------------------------------------------------------------ helpers
 
     def _load_mask(self, handle: dict, f_idx: int) -> torch.Tensor:
@@ -105,6 +127,25 @@ class HandEventStreamDataset(HandEventDataset):
                 mask_img = cv2.resize(mask_img, (W, H), interpolation=cv2.INTER_NEAREST)
             return torch.from_numpy((mask_img > 127).astype(np.float32))
         return torch.zeros((H, W), dtype=torch.float32)
+
+    def _build_label_map(self, mask: torch.Tensor) -> torch.Tensor:
+        """Mask ``(H,W)`` in ``{0,1}`` -> a per-pixel target map in ``{0, 1, -1}``.
+
+        With ``boundary_ignore_px > 0`` the morphological boundary band
+        ``dilate(mask) \\ erode(mask)`` is set to ``-1`` (ignored in the loss). Without
+        it, the map is just the binary mask. Train-only (gated by the caller).
+        """
+        if self.boundary_ignore_px <= 0:
+            return mask
+        m = (mask.numpy() > 0.5).astype(np.uint8)
+        k = self.boundary_ignore_px
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1, 2 * k + 1))
+        dil = cv2.dilate(m, kernel)
+        ero = cv2.erode(m, kernel)
+        band = (dil > 0) & (ero == 0)
+        label_map = m.astype(np.float32)
+        label_map[band] = -1.0
+        return torch.from_numpy(label_map)
 
     def _empty_sample(self):
         return (
@@ -162,7 +203,19 @@ class HandEventStreamDataset(HandEventDataset):
 
         coords = torch.stack([x, y], dim=1)                         # (N, 2) (x, y)
         feats = torch.stack([pol, t_norm], dim=1)                   # (N, 2) per event
-        labels = mask[y, x].to(torch.float32)                       # (N,)
+
+        # Per-event target. With label refinement on (train only) sample from the
+        # trimap label map (mask edge -> -1) and additionally ignore events far from
+        # the window centre, where the single-frame mask is most misaligned.
+        if self._label_refine_active:
+            label_map = self._build_label_map(mask)
+            labels = label_map[y, x].to(torch.float32)
+            if self.time_ignore_frac > 0.0:
+                f = min(self.time_ignore_frac, 0.49)
+                far = (t_norm < f) | (t_norm > 1.0 - f)
+                labels = labels.masked_fill(far, -1.0)
+        else:
+            labels = mask[y, x].to(torch.float32)                   # (N,)
         return coords, feats, t_norm, labels
 
     # ------------------------------------------------------------------- sample
