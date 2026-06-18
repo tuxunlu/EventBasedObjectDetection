@@ -133,7 +133,7 @@ class ModelInterface(pl.LightningModule):
             steps = int(eval_cfg.get("thr_steps", 19))
             self._cal_thresholds = torch.linspace(lo, hi, max(2, steps))
             self._cal_threshold = 0.5                  # calibrated operating point
-            self._cal_tp = self._cal_fp = self._cal_fn = None
+            self._reset_cal_accumulators()
             # Post-hoc spatial cleanup applied to the rasterized prediction for the
             # *_iou_clean diagnostic (and reused at inference). off by default.
             self._clean_open_ksize = int(eval_cfg.get("clean_open_ksize", 3))
@@ -178,10 +178,26 @@ class ModelInterface(pl.LightningModule):
     def on_train_epoch_end(self):
         pass
 
+    def _reset_cal_accumulators(self):
+        """Zero the per-threshold ``(tp, fp, fn)`` calibration accumulators.
+
+        Initialized to zero tensors (never ``None``) so that *every* DDP rank always
+        holds a valid, identically-shaped accumulator and unconditionally reaches the
+        ``all_gather`` in :meth:`_calibrate_event_threshold`. A rank whose val shard
+        happens to contain only empty-event windows would otherwise keep these at
+        ``None``, skip the collective, and deadlock the ranks that do call it (the
+        NCCL-watchdog ``ProcessGroupNCCL`` timeout seen at the first val-epoch end).
+        Built on ``self.device`` so the accumulation against the GPU ``sweep_counts``
+        output (and the subsequent collective) stays on the right device.
+        """
+        n = len(self._cal_thresholds)
+        zeros = lambda: torch.zeros(n, device=self.device)
+        self._cal_tp, self._cal_fp, self._cal_fn = zeros(), zeros(), zeros()
+
     def on_validation_epoch_start(self):
         # Reset the per-threshold calibration accumulators for the event task.
         if self.task == "event_segmentation":
-            self._cal_tp = self._cal_fp = self._cal_fn = None
+            self._reset_cal_accumulators()
 
     def _calibrate_event_threshold(self):
         """Pick the best-F1 decision threshold from the val-epoch count sweep.
@@ -190,20 +206,17 @@ class ModelInterface(pl.LightningModule):
         (and across DDP ranks), logs the best F1 and its threshold, and stores the
         operating point on ``self._cal_threshold`` for the preview renderer / export.
         """
-        if self._cal_tp is None:
-            return
         tp, fp, fn = self._cal_tp, self._cal_fp, self._cal_fn
         # Sum the counts across ranks so the calibration uses the whole val set.
         # all_gather adds a leading world dim; only reduce when actually distributed
-        # (in single-process it would otherwise collapse the threshold axis).
+        # (in single-process it would otherwise collapse the threshold axis). Every
+        # rank reaches this unconditionally (accumulators are zero-init, not None),
+        # so the collective is symmetric and cannot deadlock.
         ws = int(getattr(self.trainer, "world_size", 1) or 1)
         if ws > 1:
-            try:
-                tp = self.all_gather(tp).sum(dim=0)
-                fp = self.all_gather(fp).sum(dim=0)
-                fn = self.all_gather(fn).sum(dim=0)
-            except Exception:  # noqa: BLE001 - no strategy / not initialized
-                pass
+            tp = self.all_gather(tp).sum(dim=0)
+            fp = self.all_gather(fp).sum(dim=0)
+            fn = self.all_gather(fn).sum(dim=0)
         f1s = f1_from_counts(tp, fp, fn)
         best = int(torch.argmax(f1s).item())
         self._cal_threshold = float(self._cal_thresholds[best].item())
@@ -746,11 +759,10 @@ class ModelInterface(pl.LightningModule):
         # Accumulate the per-threshold counts over the val epoch for post-hoc
         # threshold calibration (computed in on_validation_epoch_end).
         if stage == "val":
+            # Accumulators are zero-init (see _reset_cal_accumulators), so just add;
+            # empty windows simply contribute nothing.
             tp, fp, fn = sweep_counts(det, labels, self._cal_thresholds)
-            if self._cal_tp is None:
-                self._cal_tp = tp.clone(); self._cal_fp = fp.clone(); self._cal_fn = fn.clone()
-            else:
-                self._cal_tp += tp; self._cal_fp += fp; self._cal_fn += fn
+            self._cal_tp += tp; self._cal_fp += fp; self._cal_fn += fn
 
         # Rasterized dense IoU: scatter per-event predictions onto a dense grid and
         # reuse binary_iou vs the teacher mask. val/test only, to keep train lean.
