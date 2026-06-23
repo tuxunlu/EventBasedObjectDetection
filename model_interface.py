@@ -717,6 +717,43 @@ class ModelInterface(pl.LightningModule):
 
         terms = self.event_loss(logits, labels, batch_idx=batch.batch_idx)
         loss = terms["total"]
+        # Auxiliary dense-shape head loss (TRAIN ONLY). The model stashes a coarse
+        # (B,1,G,G) occupancy logit map on ``self.model._aux_logits``; supervise it
+        # against the avg-pooled teacher mask (BCE + soft-Dice). This teaches the
+        # backbone the global hand-blob extent so the per-event head can reject
+        # locally-identical background. Zero effect on val/test loss and (with
+        # aux_gather off) zero inference cost — the map is dropped at export.
+        aux_logits = getattr(self.model, "_aux_logits", None)
+        if aux_logits is not None and stage == "train":
+            import torch.nn.functional as F
+            # IMPORTANT: build the GxG occupancy target from the AUGMENTED per-event
+            # labels (which travel with the events under hflip/affine), NOT from
+            # batch.dense_mask — the dataset leaves dense_mask UN-augmented (dataset
+            # L252) while coords are warped, so dense_mask is spatially misaligned on
+            # ~half the train batches. Per cell: foreground fraction over supervised
+            # (label>=0) events; empty cells are masked out of the loss.
+            G = aux_logits.shape[-1]
+            H, W = int(batch.height), int(batch.width)
+            xb = batch.coords[:, 0].long(); yb = batch.coords[:, 1].long()
+            bb = batch.batch_idx.long()
+            keep = labels >= 0
+            gy = (yb * G // H).clamp(0, G - 1); gx = (xb * G // W).clamp(0, G - 1)
+            cell = (bb * G + gy) * G + gx
+            nbins = bs * G * G
+            ck = cell[keep]
+            fgc = aux_logits.new_zeros(nbins).index_add_(0, ck, (labels[keep] > 0.5).to(aux_logits.dtype))
+            totc = aux_logits.new_zeros(nbins).index_add_(0, ck, aux_logits.new_ones(ck.shape[0]))
+            tgt = (fgc / totc.clamp(min=1.0)).view(bs, 1, G, G)    # per-cell foreground fraction
+            cmask = (totc > 0).view(bs, 1, G, G).to(aux_logits.dtype)  # supervise only non-empty cells
+            denom = cmask.sum().clamp(min=1.0)
+            bce = (F.binary_cross_entropy_with_logits(aux_logits, tgt, reduction="none") * cmask).sum() / denom
+            p = torch.sigmoid(aux_logits) * cmask; t = tgt * cmask
+            dice = 1.0 - (2.0 * (p * t).sum() + 1.0) / (p.sum() + t.sum() + 1.0)
+            w = float(getattr(self.model, "aux_shape_weight", 0.3))
+            aux = w * (0.5 * bce + 0.5 * dice)
+            loss = loss + aux
+            self.log(f'{stage}_aux_shape_loss', aux, on_step=True, on_epoch=True,
+                     prog_bar=False, sync_dist=True, batch_size=bs)
         self.log(f'{stage}_loss', loss, on_step=True, on_epoch=True,
                  prog_bar=True, sync_dist=True, batch_size=bs)
         # Log every active sub-loss (bce/rce/gce/gjs/nrdice/asl/lovasz/...) so the

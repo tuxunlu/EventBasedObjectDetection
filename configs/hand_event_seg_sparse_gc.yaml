@@ -1,0 +1,209 @@
+# Event-native 3D per-event segmentation — GLOBAL-CONTEXT model (EventSparseSegGC).
+#
+# Goal of this run
+# ----------------
+# Beat the FP-dominated 0.654-F1 GJS baseline (run 20260610-17-04-02) by fixing its
+# DIAGNOSED root cause, not by tuning the loss. Three measurement passes showed the
+# "trajectory wake" false positives are a GLOBAL-SPATIAL-CONTEXT deficit: locally a
+# busy dynamic background event looks ~identical to a hand event (bg density ~0.73x
+# the hand's), and a purely submanifold sparse-conv net never propagates features
+# across empty space (Graham et al. CVPR 2018), so the per-event head cannot tell a
+# connected hand-blob from look-alike background. Loss-side FP rebalancing already
+# FAILED to fix this: the v2/antismear config lowered pos_weight 2.0->1.0 and added a
+# precision-favoring Focal-Tversky term, yet scored 0.640 < the 0.654 baseline.
+#
+# EventSparseSegGC adds a cheap DENSE GLOBAL-CONTEXT BOTTLENECK: it time-collapses
+# the /8 sparse bottleneck into a tiny dense (B, C, 60, 80) map, runs a small dense
+# 2D context net (3x3 + dilated convs that DO cross empty space, plus a global-pool
+# branch for whole-frame context), and broadcasts the context back onto every voxel
+# before decoding. The decoder + per-event head then reason WITH global hand-blob
+# shape -> they can veto the look-alike background wake. Cost is fixed (~2.5M floats,
+# a few MFLOP) regardless of event count, so inference stays event-rate-proportional.
+#
+# CLEAN ABLATION: everything below MATCHES the winning GJS baseline (same loss incl.
+# pos_weight 2.0, same augmentation, time_bins 6, window_ms 36) EXCEPT the model, so
+# any F1 gain is attributable to the architecture. Stackable next levers (left off
+# here to keep attribution clean) are commented inline: precision-weighted Tversky,
+# train-only boundary/time label refinement, density features, and the SA-SSD/VoteNet
+# per-event center-vote aux head.
+#
+# Overfitting (the train F1 ~0.85 vs val ~0.65 gap) is attacked by levers that are
+# FREE at inference: (1) coord_mode=relative — centroid-relative geometry instead of
+# absolute (x,y), which is a subject work-LOCATION fingerprint that leaks across the
+# LOSO split; (2) drop_path 0.1 — stochastic depth on the residual blocks; (3) dropout
+# 0.2; (4) the aux occupancy head (a regularizing auxiliary task); (5) the strong
+# event augmentation below; (6) SWA weight averaging (enabled in OPTIMIZER).
+#
+# Requires spconv v2. Smoke-test the wiring first:
+#   python tools/smoke_test_event_sparse.py --model gc
+
+TRAINING:
+  deterministic: False
+  use_compile: False          # torch.compile + spconv custom ops don't mix
+  inference_mode: False
+  seed: 42
+  max_epochs: 50
+  num_sanity_val_steps: 0     # skip the fragile 2-batch sanity pass (symmetric-logging fix)
+  task: event_segmentation
+  # LOSS: identical to the 0.654 GJS baseline (GJS + per-sample Lovász, pos_weight 2.0).
+  # Deliberately NOT precision-rebalanced here: the architecture is the FP fix, and
+  # loss-side rebalancing already underperformed. To stack the loss lever afterwards,
+  # uncomment the Focal-Tversky block (alpha>beta penalizes false positives harder).
+  event_loss_config:
+    bce_weight: 0.0
+    pos_weight: 2.0
+    gjs_weight: 1.0
+    gjs_pi1: 0.5
+    lovasz_weight: 1.0
+    # tversky_weight: 0.5     # <- stack after the clean architecture run
+    # tversky_alpha: 0.7      #    (FP weight > FN weight => favor precision)
+    # tversky_beta: 0.3
+    # tversky_gamma: 1.0
+  # Decision-threshold sweep + spatial-coherence cleanup diagnostics.
+  event_eval_config:
+    thr_min: 0.05
+    thr_max: 0.95
+    thr_steps: 19
+    clean_enabled: True
+    clean_open_ksize: 3
+    clean_keep_largest: False
+    clean_min_area: 0
+  val_preview_count: 8
+
+DISTRIBUTED:
+  accelerator: gpu
+  devices: 4
+  num_nodes: 1
+  strategy: auto
+
+DATA:
+  dataset:
+    file_name: hand_event_stream_dataset
+    class_name: HandEventStreamDataset
+    dataset_init_args:
+      root_dir: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNew
+      window_ms: 36.0                   # match the winning GJS baseline
+      image_height: 480
+      image_width: 640
+      held_out_subject: tuxun           # LOSO held-out subject for val/test
+      require_teacher: True
+      action_only: False
+      mask_root: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNewTeacherMasks
+      max_events: 150000
+      # Train-only label refinement: explicitly OFF (clean ablation, matches the
+      # winning baseline). These keys MUST be present even when 0 — DataInterface's
+      # strict filter_init_args requires every dataset __init__ arg in the config.
+      # To stack the lever later, set e.g. boundary_ignore_px: 3, time_ignore_frac: 0.10.
+      boundary_ignore_px: 0
+      time_ignore_frac: 0.0
+      # Event-native augmentation (train only) — the cross-subject generalization
+      # lever (EventDrop IJCAI'21 + flips/affine/jitter). Identical to the baseline.
+      augmentation:
+        enabled: True
+        hflip_prob: 0.5
+        affine_prob: 0.5
+        rotate_deg: 15.0
+        scale_range: [0.85, 1.20]
+        translate_frac: 0.10
+        event_drop_prob: 0.5
+        event_drop_frac: [0.0, 0.5]
+        upsample_prob: 0.3
+        upsample_range: [1.0, 1.5]
+        vflip_prob: 0.0
+        jitter_px: 1.0
+        area_drop_prob: 0.25
+        area_drop_frac: 0.20
+        time_crop_prob: 0.25
+        time_crop_min: 0.7
+        time_reverse_prob: 0.2
+        polarity_flip_prob: 0.1
+        time_jitter: 0.01
+        noise_frac: 0.05
+        min_events: 64
+      num_classes: 1
+  dataloader:
+    batch_size: 8                       # matches v2; gradient-noise at bs8 is itself mild reg
+    test_batch_size: 8
+    num_workers: 8
+    persistent_workers: True
+    pin_memory: True
+    multiprocessing_context: fork
+    drop_last: True
+    shuffle_train: True
+    shuffle_val: False
+    shuffle_test: False
+
+MODEL:
+  file_name: event_sparse_seg_gc
+  class_name: EventSparseSegGC
+  model_init_args:
+    in_features: 2                      # (polarity, t_norm); geom/density synthesized in-model
+    stage_channels: [24, 32, 48, 64]
+    time_bins: 6                        # match the winning baseline (finer bins did not help)
+    num_classes: 1
+    head_hidden: 64
+    norm: ln                            # LayerNorm: LOSO-safe (no batch-stat leak)
+    algo: native                        # avoids the implicit-GEMM SIGFPE (cu120 wheel / newer torch)
+    # --- THE new core: dense global-context bottleneck -----------------------------
+    context_channels: 48                # width of the dense context map
+    context_gather: True                # also feed the gathered global context to the head
+    # --- train-only structure-aware aux head (SA-SSD style; zero inference cost) ----
+    aux_shape_head: True
+    aux_grid: 32                        # coarse GxG occupancy map supervised by the teacher mask
+    aux_shape_weight: 0.2
+    # --- overfitting / generalization levers (free at inference) --------------------
+    coord_mode: relative                # centroid-relative geom (no subject-location leak)
+    dropout: 0.2
+    drop_path: 0.1                      # stochastic depth on residual blocks
+    # density_features: False           # <- optional ablation; did not help in prior runs
+
+OPTIMIZER:
+  name: AdamW
+  arguments:
+    lr: 3e-4
+    weight_decay: 1e-4
+  gradient_accumulation:
+    enabled: False
+    scheduling: {0: 4, 4: 2, 8: 1}
+  gradient_clip:
+    enabled: True
+    gradient_clip_val: 1.0
+    gradient_clip_algorithm: norm
+  # SWA: average weights over the tail of training -> flatter optimum, better
+  # cross-subject generalization (Izmailov UAI 2018). Free at inference. LN/GN only,
+  # so the SWA BatchNorm-update pass is a harmless no-op. swa_lrs is the constant LR
+  # during the SWA phase (Lightning default start = 0.8*max_epochs => ~epoch 40).
+  stochastic_weight_averaging:
+    enabled: True
+    swa_lrs: 1e-4
+
+SCHEDULER:
+  learning_rate:
+    enabled: True
+    name: CosineAnnealingLR
+    arguments:
+      T_max: 50
+      eta_min: 1e-6
+  early_stopping:
+    enabled: False
+    monitor: val_loss_epoch
+    mode: min
+    patience: 5
+    min_delta: 1e-5
+
+LOGGER:
+  log_dir_root: lightning_logs
+  experiment_name: hand_event_seg_sparse_gc
+
+CHECKPOINT:
+  enabled: True
+  every_n_epochs: 1
+  # Monitor val_event_f1_epoch for comparability with the 0.654 baseline. NOTE the
+  # eval leak (project memory): best-epoch AND the swept threshold are both selected
+  # on the held-out subject, so treat sub-0.02 deltas as within selection noise and
+  # judge primarily by the train-vs-val LOSS gap and val_event_f1_best trend.
+  monitor: val_event_f1_epoch
+  mode: max
+  filename: "best-{epoch:03d}-{val_event_f1_epoch:.4f}"
+  save_top_k: 1
+  save_last: True

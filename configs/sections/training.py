@@ -11,6 +11,13 @@ class TrainingConfig(TrackedConfigMixin):
     inference_mode: bool = False
     seed: int = 42
     max_epochs: int = 1
+    # Lightning sanity-val steps run before training. The event task's val metrics
+    # are logged per-step with sync_dist=True; a rank whose 2-batch sanity shard
+    # contains only empty / all-ignore windows would log a different metric-key set
+    # than its peers and deadlock the epoch-end all-reduce. The symmetric-logging
+    # fix in ModelInterface makes any val epoch safe, but 0 also skips the fragile
+    # sanity pass outright. Default 2 (Lightning's default) for other tasks.
+    num_sanity_val_steps: int = 2
     # Task selector consumed by ModelInterface. "classification" preserves the
     # original Cifar template flow; "segmentation" switches to a 3-tuple
     # (voxel, mask, meta) batch contract with BCE+Dice supervision; "tracking"

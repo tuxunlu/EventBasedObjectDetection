@@ -126,6 +126,7 @@ def _build_trainer_kwargs(cfg: AppConfig, logger: TensorBoardLogger, callbacks: 
 
     trainer_kwargs = {
         "max_epochs": training_cfg.max_epochs,
+        "num_sanity_val_steps": training_cfg.num_sanity_val_steps,
         "deterministic": training_cfg.deterministic,
         "inference_mode": training_cfg.inference_mode,
         "logger": logger,

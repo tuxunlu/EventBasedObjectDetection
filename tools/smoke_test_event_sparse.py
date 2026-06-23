@@ -26,6 +26,7 @@ import torch
 from data.sparse_event_collate import collate_sparse_events
 from loss.event_distillation import EventDistillationLoss
 from model.event_sparse_seg import EventSparseSeg
+from model.event_sparse_seg_gc import EventSparseSegGC
 
 
 def _synth_sample(n_events: int, H: int, W: int, gen: torch.Generator):
@@ -57,6 +58,11 @@ def main() -> int:
     ap.add_argument("--in_features", type=int, default=2)
     ap.add_argument("--time_bins", type=int, default=6)
     ap.add_argument("--max_params", type=int, default=1_200_000)
+    ap.add_argument("--model", choices=("ess", "gc"), default="ess",
+                    help="ess = EventSparseSeg (submanifold U-Net); "
+                         "gc = EventSparseSegGC (+ dense global-context bottleneck).")
+    ap.add_argument("--coord_mode", default="relative",
+                    help="EventSparseSegGC geometry mode: relative|absolute|both|none.")
     ap.add_argument("--algo", default="implicit_gemm",
                     help="spconv conv algo: 'native' avoids the implicit-GEMM SIGFPE "
                          "under a CUDA runtime newer than the spconv wheel.")
@@ -85,16 +91,26 @@ def main() -> int:
     print(f"[data ] batch_size={batch.batch_size} total_events={n_ev} "
           f"feat_dim={batch.feats.shape[1]}")
 
-    model = EventSparseSeg(in_features=args.in_features, time_bins=args.time_bins,
-                           num_classes=1, algo=args.algo,
-                           geom_features=args.geom, density_features=args.density,
-                           density_time_resolved=args.density_time_resolved,
-                           temporal_interp_head=args.temporal_interp_head,
-                           recurrent=args.recurrent).to(device)
-    print(f"[model] geom_features={args.geom} density_features={args.density} "
-          f"density_time_resolved={args.density_time_resolved} "
-          f"temporal_interp_head={args.temporal_interp_head} "
-          f"recurrent={args.recurrent} n_extra={model.n_extra}")
+    if args.model == "gc":
+        model = EventSparseSegGC(in_features=args.in_features, time_bins=args.time_bins,
+                                 num_classes=1, algo=args.algo,
+                                 coord_mode=args.coord_mode,
+                                 density_features=args.density).to(device)
+        print(f"[model] EventSparseSegGC coord_mode={args.coord_mode} "
+              f"density_features={args.density} context_channels={model.context_channels} "
+              f"aux_shape_head={model.aux_shape_head} n_extra={model.n_extra}")
+    else:
+        model = EventSparseSeg(in_features=args.in_features, time_bins=args.time_bins,
+                               num_classes=1, algo=args.algo,
+                               geom_features=args.geom, density_features=args.density,
+                               density_time_resolved=args.density_time_resolved,
+                               temporal_interp_head=args.temporal_interp_head,
+                               recurrent=args.recurrent).to(device)
+        print(f"[model] EventSparseSeg geom_features={args.geom} "
+              f"density_features={args.density} "
+              f"density_time_resolved={args.density_time_resolved} "
+              f"temporal_interp_head={args.temporal_interp_head} "
+              f"recurrent={args.recurrent} n_extra={model.n_extra}")
     n_params = model.count_parameters()
     print(f"[model] params={n_params:,}  (budget <= {args.max_params:,})")
     assert n_params <= args.max_params, "parameter budget exceeded"
@@ -109,7 +125,14 @@ def main() -> int:
     loss_fn = EventDistillationLoss(pos_weight=2.0, sce_beta=1.0, sce_alpha=0.1,
                                     lovasz_weight=1.0)
     terms = loss_fn(logits, batch.labels, batch_idx=batch.batch_idx)
-    terms["total"].backward()
+    total = terms["total"]
+    # The GC model's train-only aux occupancy head only gets gradient when its logits
+    # are in the loss (ModelInterface supervises it against the teacher mask). Add a
+    # crude aux term here so the all-params-receive-grad check covers the aux head.
+    aux_logits = getattr(model, "_aux_logits", None)
+    if aux_logits is not None:
+        total = total + 0.2 * aux_logits.float().mean()
+    total.backward()
     n_grad = sum(int(p.grad is not None) for p in model.parameters() if p.requires_grad)
     n_train = sum(1 for p in model.parameters() if p.requires_grad)
     print(f"[loss ] total={terms['total'].item():.4f} bce={terms['bce'].item():.4f} "

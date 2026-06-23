@@ -305,6 +305,10 @@ class EventSparseSeg(nn.Module):
         recurrent: bool = False,
         recurrent_hidden: int | None = None,
         recurrent_bidirectional: bool = True,
+        aux_shape_head: bool = False,
+        aux_grid: int = 32,
+        aux_gather: bool = False,
+        aux_shape_weight: float = 0.3,
     ):
         super().__init__()
         require_spconv()  # fail fast with a clear install hint
@@ -319,6 +323,15 @@ class EventSparseSeg(nn.Module):
         self.density_radius = max(1, int(density_radius))
         self.density_time_resolved = bool(density_time_resolved)
         self.temporal_interp_head = bool(temporal_interp_head)
+        # Auxiliary coarse dense-shape head (spatial global-shape prior; see forward).
+        # Training-only by default (zero inference cost); aux_gather turns the predicted
+        # occupancy into a runtime per-event spatial-membership channel (+1 head input).
+        self.aux_shape_head = bool(aux_shape_head)
+        self.aux_grid = int(aux_grid)
+        self.aux_gather = bool(aux_gather and aux_shape_head)
+        self.aux_shape_weight = float(aux_shape_weight)
+        self._aux_extra = 1 if self.aux_gather else 0
+        self._aux_logits = None
         # Extra per-event channels synthesized in forward (post-augmentation):
         # +2 for (x_norm, y_norm), +3 for (log-density, nbhd time mean, nbhd time std).
         self.n_extra = (2 if self.geom_features else 0) \
@@ -365,12 +378,27 @@ class EventSparseSeg(nn.Module):
         # overfitting; nn.Dropout(0.0) is a no-op so the default path is unchanged.
         self.feat_drop = nn.Dropout(float(dropout))
         self.head = nn.Sequential(
-            nn.Linear(c0 + feat_dim, head_hidden),
+            nn.Linear(c0 + feat_dim + self._aux_extra, head_hidden),
             nn.LayerNorm(head_hidden) if norm == "ln" else nn.Identity(),
             nn.ReLU(inplace=True),
             nn.Dropout(float(dropout)),
             nn.Linear(head_hidden, num_classes),
         )
+
+        # Auxiliary dense-shape head: a tiny 2D conv stack on the coarse (B, c0, G, G)
+        # grid pooled from the decoder's per-voxel features, predicting a GxG occupancy
+        # map supervised (train only, in ModelInterface) against the avg-pooled teacher
+        # mask. GroupNorm(1, .) (LOSO-safe; no batch stats). Dropped at export unless
+        # aux_gather feeds the predicted occupancy back into the per-event head.
+        if self.aux_shape_head:
+            self.aux_shape = nn.Sequential(
+                nn.Conv2d(c0, max(c0 // 2, 1), kernel_size=3, padding=1, bias=False),
+                nn.GroupNorm(1, max(c0 // 2, 1)),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(max(c0 // 2, 1), 1, kernel_size=3, padding=1),
+            )
+        else:
+            self.aux_shape = None
 
     # ------------------------------------------------------------------ helpers
 
@@ -463,6 +491,7 @@ class EventSparseSeg(nn.Module):
         return torch.cat(parts, dim=1).to(times.dtype if times.is_floating_point() else torch.float32)
 
     def forward(self, batch) -> torch.Tensor:
+        self._aux_logits = None              # reset per call; set below when aux active
         feats = batch.feats
         N = feats.shape[0]
         if N == 0:
@@ -515,6 +544,25 @@ class EventSparseSeg(nn.Module):
         vox_out = torch.empty_like(of)
         vox_out[torch.argsort(in_key)] = of[torch.argsort(out_key)]
 
+        # Auxiliary coarse dense-shape prior. Scatter-mean the realigned per-voxel c0
+        # features (the exact features the per-event head reads) into a tiny dense
+        # (B, c0, G, G) grid with t collapsed, and predict a GxG occupancy map. The
+        # SAM2 teacher mask supervises it (train, in ModelInterface) so the backbone
+        # learns WHERE the compact hand blob is -> the per-event head can then veto
+        # locally-identical background. Runs only when needed (training, or when the
+        # gather feeds it back at inference), so inference stays zero-cost by default.
+        if self.aux_shape is not None and (self.training or self.aux_gather):
+            G = self.aux_grid
+            gy = (vox_coords[:, 1] * G // H).clamp(0, G - 1)
+            gx = (vox_coords[:, 2] * G // W).clamp(0, G - 1)
+            cell = (vox_batch * G + gy) * G + gx                      # (M,) per-sample cell id
+            Bn, C0 = batch.batch_size, vox_out.shape[1]
+            gsum = vox_out.new_zeros(Bn * G * G, C0).index_add_(0, cell, vox_out)
+            gcnt = vox_out.new_zeros(Bn * G * G, 1).index_add_(
+                0, cell, vox_out.new_ones(cell.shape[0], 1))
+            grid = (gsum / gcnt.clamp(min=1.0)).view(Bn, G, G, C0).permute(0, 3, 1, 2)
+            self._aux_logits = self.aux_shape(grid.contiguous())     # (B, 1, G, G)
+
         # Per-event head: gather each event's voxel context feature, concat the
         # event's own raw features, MLP -> per-event logit. Dropout on the gathered
         # context regularizes the backbone features (the raw event feats pass through).
@@ -538,7 +586,20 @@ class EventSparseSeg(nn.Module):
             ev_ctx = self.feat_drop((1.0 - w) * ctx_lo + w * ctx_hi)
         else:
             ev_ctx = self.feat_drop(vox_out[inverse])      # (N, c0)
-        logits = self.head(torch.cat([ev_ctx, feats], dim=1))   # (N, num_classes)
+        # Optional runtime spatial-membership channel: gather each event's predicted
+        # occupancy from the coarse map at its OWN (x, y) cell (nearest-cell flat
+        # index, not grid_sample -> no per-event map replication). Routed by the
+        # event's own coords, so the logits[i] <-> labels[i] contract is preserved.
+        if self.aux_gather and self._aux_logits is not None:
+            G = self.aux_grid
+            occ = torch.sigmoid(self._aux_logits)                      # (B, 1, G, G)
+            egy = (y * G // H).clamp(0, G - 1).long()
+            egx = (x * G // W).clamp(0, G - 1).long()
+            ev_occ = occ[batch.batch_idx.long(), 0, egy, egx].unsqueeze(1)  # (N, 1)
+            head_in = torch.cat([ev_ctx, feats, ev_occ], dim=1)
+        else:
+            head_in = torch.cat([ev_ctx, feats], dim=1)
+        logits = self.head(head_in)                        # (N, num_classes)
 
         if self.num_classes == 1:
             return logits.squeeze(-1)                      # (N,)

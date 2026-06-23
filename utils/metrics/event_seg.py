@@ -31,6 +31,12 @@ def _binarize(logits: torch.Tensor, threshold: float) -> torch.Tensor:
 def _counts(logits: torch.Tensor, labels: torch.Tensor, threshold: float):
     pred = _binarize(logits, threshold)
     labels = labels.float()
+    # Drop trimap "ignore" events (label < 0). Without this, a -1 label makes
+    # (pred*labels) negative and (pred*(1-labels)) inflated, so tp/fp/fn become
+    # signed garbage and F1/precision/recall leave [0, 1]. Matches sweep_counts.
+    keep = labels >= 0
+    if keep.numel() and not bool(keep.all()):
+        pred, labels = pred[keep], labels[keep]
     tp = (pred * labels).sum()
     fp = (pred * (1.0 - labels)).sum()
     fn = ((1.0 - pred) * labels).sum()
