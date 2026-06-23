@@ -31,6 +31,7 @@ TRAINING:
   inference_mode: False
   seed: 42
   max_epochs: 50
+  num_sanity_val_steps: 0          # skip the fragile sanity pass (symmetric-logging fix covers full epochs)
   task: event_segmentation
   # GJS (noise-robust pointwise) + Lovász (IoU surrogate), rebalanced toward precision:
   # pos_weight 1.0 and a Focal-Tversky term with alpha>beta (penalize FALSE POSITIVES
@@ -54,7 +55,7 @@ TRAINING:
     clean_open_ksize: 3       # morphological open: drops 1-px speckle
     clean_keep_largest: False # set True to keep only the hand+arm blob
     clean_min_area: 0
-  val_preview_count: 4
+  val_preview_count: 8
 
 DISTRIBUTED:
   accelerator: gpu
@@ -135,8 +136,16 @@ MODEL:
     density_time_resolved: True
     # ANTI-SMEAR (3): per-event head reads context interpolated across adjacent t_bins.
     temporal_interp_head: True
-    # Bottleneck GRU OFF: full-T recurrent sweep smears foreground along the wake columns.
+    # Bottleneck GRU OFF: full-T recurrent sweep smears foreground along the wake columns
+    # (ruled out as the wake cause; non-recurrent 0.6405 > recurrent 0.6261). Frees ~58k params.
     recurrent: False
+    # SPATIAL global-shape fix (hypothesis A: background is locally ~identical to the hand,
+    # so the per-event net needs to know WHERE the blob is). Training-only aux dense-shape
+    # head supervised by the teacher mask; zero inference cost unless aux_gather is on.
+    aux_shape_head: True
+    aux_grid: 32                      # coarse GxG occupancy map (<=32, T-collapsed)
+    aux_gather: False                 # True => +1 runtime per-event occupancy channel (~1.6k params)
+    aux_shape_weight: 0.1             # weight on the BCE+Dice aux term (lowered: LOSO overfits fast)
 
 OPTIMIZER:
   name: AdamW
@@ -170,7 +179,7 @@ SCHEDULER:
 
 LOGGER:
   log_dir_root: lightning_logs
-  experiment_name: hand_event_seg_sparse_gjs_v2_antismear
+  experiment_name: hand_event_seg_sparse_gjs_v2_antismear_auxshape
 
 CHECKPOINT:
   enabled: True
