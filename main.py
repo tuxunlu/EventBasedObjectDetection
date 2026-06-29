@@ -129,6 +129,10 @@ def _build_trainer_kwargs(cfg: AppConfig, logger: TensorBoardLogger, callbacks: 
         "num_sanity_val_steps": training_cfg.num_sanity_val_steps,
         "deterministic": training_cfg.deterministic,
         "inference_mode": training_cfg.inference_mode,
+        # Optional throttles (None -> dropped below -> Trainer default).
+        "val_check_interval": getattr(training_cfg, "val_check_interval", None),
+        "limit_val_batches": getattr(training_cfg, "limit_val_batches", None),
+        "limit_train_batches": getattr(training_cfg, "limit_train_batches", None),
         "logger": logger,
         "callbacks": callbacks,
         "accelerator": distributed_cfg.accelerator,

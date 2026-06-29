@@ -18,6 +18,13 @@ class TrainingConfig(TrackedConfigMixin):
     # fix in ModelInterface makes any val epoch safe, but 0 also skips the fragile
     # sanity pass outright. Default 2 (Lightning's default) for other tasks.
     num_sanity_val_steps: int = 2
+    # Optional Lightning Trainer throttles (default None -> Trainer default). int = a
+    # batch COUNT, float = a fraction. With a huge epoch (~24.5k steps here) these let a
+    # run validate mid-epoch for an early signal and cap val cost. Passed through to the
+    # Trainer in main.py; None-valued ones are dropped (current behavior preserved).
+    val_check_interval: Optional[Any] = None
+    limit_val_batches: Optional[Any] = None
+    limit_train_batches: Optional[Any] = None
     # Task selector consumed by ModelInterface. "classification" preserves the
     # original Cifar template flow; "segmentation" switches to a 3-tuple
     # (voxel, mask, meta) batch contract with BCE+Dice supervision; "tracking"

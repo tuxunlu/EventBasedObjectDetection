@@ -81,6 +81,69 @@ def _lovasz_hinge_per_sample(logits, labels, batch_idx) -> torch.Tensor:
     return torch.stack(losses).mean()
 
 
+def background_prototype_loss(emb, labels, batch_idx, margin: float = 1.0,
+                              eps: float = 1e-6) -> torch.Tensor:
+    """Discriminative background-anchored **null-state** loss (per-event embeddings).
+
+    The global-context segmenter has no learned "no-hand" state, so on a quiet /
+    handless window its additive prior still paints a blob (measured FP regression).
+    This is the discriminative pull-push idea (De Brabandere et al., CVPR-W 2017,
+    arXiv:1708.02551) used as an explicit null state:
+
+      * **pull** every BACKGROUND event embedding toward its per-sample background
+        prototype (the mean background embedding) — tightening one coherent
+        background cluster;
+      * **push** every FOREGROUND event embedding to at least ``margin`` away from
+        that background prototype.
+
+    On a window with **no hand**, every event is background → they collapse to a
+    single tight cluster and there is no foreground prototype to drift toward, so the
+    head is explicitly taught the null state instead of hallucinating a figure. The
+    border-ownership literature is explicit that ownership presupposes a figure, so a
+    boundary loss (≈0 gradient on an empty window) cannot do this — a background
+    anchor can. Cost is O(N) + per-sample means; the "push" is the trivial binary
+    case of the O(C²) inter-cluster term.
+
+    ``emb`` is ``(N, D)``; ``labels`` ``(N,)`` in ``{0,1}`` (``<0`` = ignore, dropped);
+    ``batch_idx`` ``(N,)`` groups events by sample so prototypes are per-window.
+    """
+    labels = labels.float()
+    if labels.numel() and (labels < 0).any():
+        keep = labels >= 0
+        emb = emb[keep]; labels = labels[keep]
+        batch_idx = batch_idx[keep] if batch_idx is not None else None
+    if emb.shape[0] == 0:
+        return emb.sum() * 0.0
+    if batch_idx is None:
+        batch_idx = torch.zeros(emb.shape[0], dtype=torch.long, device=emb.device)
+    batch_idx = batch_idx.long()
+    Bn = int(batch_idx.max().item()) + 1
+    D = emb.shape[1]
+    bg = labels < 0.5
+    # Per-sample background prototype = mean background embedding (no-bg samples -> 0,
+    # masked out below via has_bg so they contribute nothing).
+    proto = emb.new_zeros(Bn, D)
+    pc = emb.new_zeros(Bn, 1)
+    if bool(bg.any()):
+        bidx = batch_idx[bg]
+        proto.index_add_(0, bidx, emb[bg])
+        pc.index_add_(0, bidx, emb.new_ones(bidx.shape[0], 1))
+    proto = proto / pc.clamp_min(1.0)
+    proto_e = proto[batch_idx]
+    dist = torch.linalg.vector_norm(emb - proto_e, dim=1)
+    has_bg = pc[batch_idx, 0] > 0
+    terms = []
+    pull_m = bg & has_bg
+    push_m = (~bg) & has_bg
+    if bool(pull_m.any()):
+        terms.append((dist[pull_m] ** 2).mean())
+    if bool(push_m.any()):
+        terms.append(((margin - dist[push_m]).clamp_min(0.0) ** 2).mean())
+    if not terms:
+        return emb.sum() * 0.0
+    return torch.stack(terms).mean()
+
+
 class EventDistillationLoss(nn.Module):
     """Composable per-event mask-distillation loss (noise- and imbalance-aware).
 

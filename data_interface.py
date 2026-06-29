@@ -86,20 +86,30 @@ class DataInterface(pl.LightningDataModule):
     
     @staticmethod
     def filter_init_args(cls, config_dict):
-        """
-        Checks if config_dict has all required arguments for cls.__init__
+        """Build dataset init kwargs from ``config_dict``.
+
+        A parameter is pulled from the config when present; a parameter that HAS a
+        default may be omitted (the class default is used), so adding a new defaulted
+        ``__init__`` arg to a dataset does NOT require every pre-existing config to list
+        it. ``self`` / ``purpose`` (passed separately) and ``*args`` / ``**kwargs`` are
+        skipped; only parameters WITHOUT a default are required. (Matches
+        ModelInterface.filter_init_args.)
         """
         init_args = dict()
-        for name in inspect.signature(cls.__init__).parameters.keys():
-            # Skip 'self', '*args', '**kwargs' and parameters with defaults
-            if name not in ('self', 'purpose'):
+        missing_required = []
+        for name, param in inspect.signature(cls.__init__).parameters.items():
+            if name in ('self', 'purpose'):
+                continue
+            if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+                continue
+            if name in config_dict:
                 init_args[name] = config_dict[name]
-        provided_keys = set(config_dict.keys())
-        missing_keys = init_args.keys() - provided_keys
-        
-        if missing_keys:
-            raise ValueError(f"In dataset initialization, found missing config keys for {cls.__name__}: {missing_keys}")
-        
+            elif param.default is inspect.Parameter.empty:
+                missing_required.append(name)
+        if missing_required:
+            raise ValueError(
+                f"In dataset initialization, found missing required config keys for "
+                f"{cls.__name__}: {missing_required}")
         return init_args
 
     def __load_data_module(self):

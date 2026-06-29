@@ -532,6 +532,15 @@ class ModelInterface(pl.LightningModule):
         terms = self.seg_loss(logits, mask)
         loss = terms["total"]
 
+        # Train-only JEPA pretext for dense frame models (e.g. EventJEPAFrame);
+        # mirrors the sparse _event_segmentation_step hook. No-op for plain EventUnet.
+        jl = getattr(self.model, "_jepa_loss", None)
+        jw = float(getattr(self.model, "jepa_weight", 0.0))
+        if jl is not None and stage == "train" and jw > 0.0:
+            loss = loss + jw * jl
+            self.log(f'{stage}_jepa_loss', jw * jl, on_step=True, on_epoch=True,
+                     prog_bar=False, sync_dist=True, batch_size=voxel.shape[0])
+
         bs = voxel.shape[0]
         self.log(f'{stage}_loss', loss, on_step=True, on_epoch=True,
                  prog_bar=True, sync_dist=True, batch_size=bs)
@@ -753,6 +762,57 @@ class ModelInterface(pl.LightningModule):
             aux = w * (0.5 * bce + 0.5 * dice)
             loss = loss + aux
             self.log(f'{stage}_aux_shape_loss', aux, on_step=True, on_epoch=True,
+                     prog_bar=False, sync_dist=True, batch_size=bs)
+        # Background-prototype NULL loss (TRAIN ONLY). The model stashes the per-event
+        # penultimate embedding on ``self.model._event_embedding`` when its
+        # ``null_loss_weight`` is on; pull background events to a tight per-window
+        # cluster and push foreground away, teaching an explicit no-hand state so the
+        # global prior stops hallucinating a blob on quiet windows. Zero inference cost.
+        emb = getattr(self.model, "_event_embedding", None)
+        nw = float(getattr(self.model, "null_loss_weight", 0.0))
+        if emb is not None and stage == "train" and nw > 0.0:
+            from loss.event_distillation import background_prototype_loss
+            nm = float(getattr(self.model, "null_margin", 1.0))
+            null = nw * background_prototype_loss(emb, labels, batch.batch_idx, margin=nm)
+            loss = loss + null
+            self.log(f'{stage}_null_loss', null, on_step=True, on_epoch=True,
+                     prog_bar=False, sync_dist=True, batch_size=bs)
+        # Per-window PRESENCE gate loss (TRAIN ONLY). When the model exposes a
+        # ``_presence_logit`` (one "is a moving hand present in this window?" logit per
+        # sample), supervise it with BCE against whether the window has any foreground
+        # event. The model already adds log-sigmoid(presence) to every event logit, so
+        # learning this gate suppresses ALL events on no-hand / no-motion windows — the
+        # direct fix for the static-noise false positives. A linear probe on the frozen
+        # gc context descriptor already separates hand/no-hand windows at AUC≈1.0, so
+        # this head only has to read out a signal the context already encodes. Zero
+        # inference cost beyond one tiny MLP on the global descriptor.
+        pl = getattr(self.model, "_presence_logit", None)
+        pw = float(getattr(self.model, "presence_gate_weight", 0.0))
+        if pl is not None and stage == "train" and pw > 0.0:
+            import torch.nn.functional as F
+            bidx = batch.batch_idx.long()
+            fg = (labels > 0.5).to(pl.dtype)
+            pos = pl.new_zeros(bs).index_add_(0, bidx, fg)            # fg events / window
+            min_fg = float(getattr(self.model, "presence_min_fg", 0))
+            tgt = (pos > min_fg).to(pl.dtype)                        # (B,) hand present?
+            presence = pw * F.binary_cross_entropy_with_logits(pl, tgt)
+            loss = loss + presence
+            self.log(f'{stage}_presence_loss', presence, on_step=True, on_epoch=True,
+                     prog_bar=False, sync_dist=True, batch_size=bs)
+            self.log(f'{stage}_presence_acc',
+                     ((pl > 0).to(tgt.dtype) == tgt).float().mean(),
+                     on_step=False, on_epoch=True, prog_bar=False, sync_dist=True,
+                     batch_size=bs)
+        # JEPA latent-prediction pretext (TRAIN ONLY). EventJEPASeg stashes its scalar
+        # latent loss on ``self.model._jepa_loss`` when ``jepa_weight`` is on; add it
+        # so the encoder learns motion/dynamics jointly with the per-event head. The
+        # predictor + EMA target encoder are train-only -> zero inference cost.
+        jl = getattr(self.model, "_jepa_loss", None)
+        jw = float(getattr(self.model, "jepa_weight", 0.0))
+        if jl is not None and stage == "train" and jw > 0.0:
+            jepa = jw * jl
+            loss = loss + jepa
+            self.log(f'{stage}_jepa_loss', jepa, on_step=True, on_epoch=True,
                      prog_bar=False, sync_dist=True, batch_size=bs)
         self.log(f'{stage}_loss', loss, on_step=True, on_epoch=True,
                  prog_bar=True, sync_dist=True, batch_size=bs)

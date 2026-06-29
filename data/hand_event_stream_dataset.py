@@ -63,6 +63,11 @@ class HandEventStreamDataset(HandEventDataset):
         augmentation=None,
         boundary_ignore_px: int = 0,
         time_ignore_frac: float = 0.0,
+        time_ignore_val: bool = False,
+        split_mode: str = "loso",
+        val_frac: float = 0.1,
+        test_frac: float = 0.1,
+        split_seed: int = 0,
     ):
         # voxel_bins is irrelevant on the event path; pass a harmless 1. The parent's
         # dense voxel/mask augmenter is left OFF (augmentation=None below) — this path
@@ -80,6 +85,10 @@ class HandEventStreamDataset(HandEventDataset):
             mask_root=mask_root,
             augmentation=None,
             provide_rgb=False,
+            split_mode=split_mode,
+            val_frac=val_frac,
+            test_frac=test_frac,
+            split_seed=split_seed,
         )
         self.max_events = int(max_events)
         # Event-native augmentation (train only). dict() defends against an OmegaConf
@@ -98,12 +107,19 @@ class HandEventStreamDataset(HandEventDataset):
         #   * time_ignore_frac: events far from the window centre (where the mask was
         #     captured) are the most spatially misaligned with it. Events in the first
         #     / last ``time_ignore_frac`` of the normalized window are marked -1.
-        # Applied to the supervision target only; val/test keep clean {0,1} labels so
-        # the logged F1/IoU stay honest, and ``dense_mask`` is always the clean mask.
+        # Applied to the supervision target only; val/test normally keep clean {0,1}
+        # labels so the logged F1/IoU stay honest, and ``dense_mask`` is always clean.
+        # EXCEPTION (``time_ignore_val=True``): with a LONG window (e.g. 144ms) the
+        # single center-frame mask mislabels off-center events, so scoring them is NOT
+        # honest — applying the center-band ignore at val/test too makes the metric
+        # honest (the -1 events are dropped by event_f1/precision/recall, which filter
+        # ``labels >= 0``). Keep ``boundary_ignore_px=0`` at val to leave boundary F1
+        # untouched. SSL/residual still see all events (labels are a loss/metric concern).
         self.boundary_ignore_px = int(boundary_ignore_px)
         self.time_ignore_frac = float(time_ignore_frac)
+        self.time_ignore_val = bool(time_ignore_val)
         self._label_refine_active = (
-            purpose == "train"
+            (purpose == "train" or self.time_ignore_val)
             and (self.boundary_ignore_px > 0 or self.time_ignore_frac > 0.0)
         )
 

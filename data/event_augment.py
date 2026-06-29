@@ -16,6 +16,11 @@ of freedom — geometric (pose/size/position), density (drop/sample), and noise 
 plus event-specific temporal/polarity transforms.
 
 Pipeline order (each step gated by its own probability):
+  0. hand-drop:   (train null-state lever) with prob ``hand_drop_prob`` convert a
+                  hand-present window into a NO-HAND negative — drop every
+                  foreground (and ignore) event and zero the remaining labels, so
+                  the model sees the same scene's background events with an empty
+                  target and learns a real "no hand here" state.
   1. geometric:   h/v-flip, affine (rotate/scale/translate), sub-pixel jitter
   2. bounds:      round to pixels, drop out-of-frame events (+ their labels)
   3. density:     random event drop (speed/density invariance), area drop (occlusion)
@@ -34,6 +39,7 @@ import math
 from typing import Any, Dict, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 
 
 def _coin(p: float, gen: torch.Generator) -> bool:
@@ -63,6 +69,9 @@ class EventAugmentor:
         upsample_range:     [1,1]   # [min,max] density multiplier r (duplicate r-1 frac)
         area_drop_prob:     0.0     # prob of dropping all events in a random box
         area_drop_frac:     0.0     # box side as a fraction of (W,H)
+        area_drop_count:    1       # number of independent occlusion boxes to drop
+        hand_drop_prob:     0.0     # prob of converting a window into a NO-HAND negative
+        hand_drop_dilate_px: 0      # also drop bg events within this many px of any fg event
         time_crop_prob:     0.0     # prob of keeping only a temporal sub-window
         time_crop_min:      1.0     # min retained temporal fraction
         time_reverse_prob:  0.0     # reverse time AND flip polarity (physical)
@@ -91,6 +100,9 @@ class EventAugmentor:
         self.upsample_range = (float(ur[0]), float(ur[1]))
         self.area_drop_prob = float(c.get("area_drop_prob", 0.0))
         self.area_drop_frac = float(c.get("area_drop_frac", 0.0))
+        self.area_drop_count = max(1, int(c.get("area_drop_count", 1)))
+        self.hand_drop_prob = float(c.get("hand_drop_prob", 0.0))
+        self.hand_drop_dilate_px = max(0, int(c.get("hand_drop_dilate_px", 0)))
         self.time_crop_prob = float(c.get("time_crop_prob", 0.0))
         self.time_crop_min = float(c.get("time_crop_min", 1.0))
         self.time_reverse_prob = float(c.get("time_reverse_prob", 0.0))
@@ -119,6 +131,38 @@ class EventAugmentor:
         pol = feats[:, 0].clone()
         t = times.clone().float()
         lab = labels.clone().float()
+
+        # 0. hand-drop: synthesize a NO-HAND negative from a hand-present window.
+        # Real empty-mask negatives already exist (~12% of train frames, ~91% of them
+        # event-busy), yet the GC model still paints a static-scene blob — passive
+        # exposure does not override its additive "a hand exists here" prior. So this
+        # is not about adding the FIRST negatives; it OVERSAMPLES clean, SCENE-PAIRED
+        # ones: drop EVERY foreground event (label > 0.5) and any ignore/boundary
+        # event (label < 0), leaving this exact scene's BACKGROUND events with an
+        # all-zero target. Same scene with vs. without the hand directly breaks the
+        # "this scene => hand" memorization (separate empty-mask frames cannot), and
+        # the labels are guaranteed clean (a missing teacher mask may be a failure on
+        # a hand-present frame; removing KNOWN foreground is not).
+        # Skipped if the window has no foreground or would fall below ``min_events``.
+        if _coin(self.hand_drop_prob, gen):
+            fg = lab > 0.5
+            if int(fg.sum()) > 0:
+                drop = fg | (lab < 0.0)
+                if self.hand_drop_dilate_px > 0:
+                    # Also drop background events within ``dilate_px`` of any
+                    # foreground event so no thin residual silhouette survives.
+                    xr = x.round().long().clamp(0, W - 1)
+                    yr = y.round().long().clamp(0, H - 1)
+                    grid = x.new_zeros(H, W)
+                    grid[yr[fg], xr[fg]] = 1.0
+                    k = 2 * self.hand_drop_dilate_px + 1
+                    dil = F.max_pool2d(grid[None, None], k, stride=1,
+                                       padding=self.hand_drop_dilate_px)[0, 0]
+                    drop = drop | (dil[yr, xr] > 0)
+                keep = ~drop
+                if int(keep.sum()) >= self.min_events:
+                    x, y, pol, t = x[keep], y[keep], pol[keep], t[keep]
+                    lab = torch.zeros(int(keep.sum()), dtype=lab.dtype, device=lab.device)
 
         # 1. geometric ---------------------------------------------------------
         if _coin(self.hflip_prob, gen):
@@ -172,9 +216,13 @@ class EventAugmentor:
         if xi.shape[0] > self.min_events and _coin(self.area_drop_prob, gen):
             bw, bh = int(self.area_drop_frac * W), int(self.area_drop_frac * H)
             if bw > 0 and bh > 0:
-                bx = int(_uniform(0, max(W - bw, 1), gen))
-                by = int(_uniform(0, max(H - bh, 1), gen))
-                inbox = (xi >= bx) & (xi < bx + bw) & (yi >= by) & (yi < by + bh)
+                # Drop ``area_drop_count`` independent occlusion boxes; harder
+                # occlusion than a single box without risking the whole window.
+                inbox = torch.zeros(xi.shape[0], dtype=torch.bool)
+                for _ in range(self.area_drop_count):
+                    bx = int(_uniform(0, max(W - bw, 1), gen))
+                    by = int(_uniform(0, max(H - bh, 1), gen))
+                    inbox |= ((xi >= bx) & (xi < bx + bw) & (yi >= by) & (yi < by + bh))
                 keep = ~inbox
                 if int(keep.sum()) >= self.min_events:
                     xi, yi, pol, t, lab = xi[keep], yi[keep], pol[keep], t[keep], lab[keep]

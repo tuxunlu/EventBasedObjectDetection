@@ -165,6 +165,10 @@ class HandEventDataset(data.Dataset):
         mask_root: Optional[str] = None,
         augmentation: Optional[Dict[str, Any]] = None,
         provide_rgb: bool = False,
+        split_mode: str = "loso",
+        val_frac: float = 0.1,
+        test_frac: float = 0.1,
+        split_seed: int = 0,
     ):
         super().__init__()
         self.root = Path(root_dir)
@@ -200,22 +204,50 @@ class HandEventDataset(data.Dataset):
             raise RuntimeError(f"No sequence_* folders found under {self.root}")
 
         subjects = sorted({_parse_subject(p.name) for p in all_sequences})
-        if held_out_subject is None:
-            held_out_subject = subjects[-1]
-        if held_out_subject not in subjects:
-            raise ValueError(f"held_out_subject={held_out_subject!r} not in {subjects}")
-        self.held_out_subject = held_out_subject
+        self.split_mode = str(split_mode).lower()
 
-        if purpose == "train":
-            keep = lambda s: _parse_subject(s.name) != held_out_subject
-        elif purpose in ("validation", "test"):
-            keep = lambda s: _parse_subject(s.name) == held_out_subject
+        if self.split_mode == "loso":
+            # Subject-disjoint (leave-one-subject-out): train = all-but-held-out,
+            # val/test = held-out subject. Cross-subject generalization.
+            if held_out_subject is None:
+                held_out_subject = subjects[-1]
+            if held_out_subject not in subjects:
+                raise ValueError(f"held_out_subject={held_out_subject!r} not in {subjects}")
+            self.held_out_subject = held_out_subject
+            if purpose == "train":
+                keep = lambda s: _parse_subject(s.name) != held_out_subject
+            elif purpose in ("validation", "test"):
+                keep = lambda s: _parse_subject(s.name) == held_out_subject
+            else:
+                raise ValueError(f"Unknown purpose: {purpose}")
+            self.sequences = [p for p in all_sequences if keep(p)]
+        elif self.split_mode in ("all", "mixed", "random"):
+            # ALL subjects in EVERY split; hold out whole SEQUENCES (never frames —
+            # adjacent per-frame windows overlap heavily, so a frame-level holdout would
+            # leak). Deterministic + identical across the train/validation/test instances
+            # (same sorted pool + same seed), so the splits are disjoint by construction.
+            # Within-distribution generalization (removes the LOSO diversity ceiling).
+            self.held_out_subject = None
+            order = sorted(p.name for p in all_sequences)
+            random.Random(int(split_seed)).shuffle(order)
+            n = len(order)
+            n_val = max(1, int(round(float(val_frac) * n)))
+            n_test = max(1, int(round(float(test_frac) * n)))
+            val_set = set(order[:n_val])
+            test_set = set(order[n_val:n_val + n_test])
+            def split_of(name):
+                return "val" if name in val_set else ("test" if name in test_set else "train")
+            target = {"train": "train", "validation": "val", "test": "test"}.get(purpose)
+            if target is None:
+                raise ValueError(f"Unknown purpose: {purpose}")
+            self.sequences = [p for p in all_sequences if split_of(p.name) == target]
         else:
-            raise ValueError(f"Unknown purpose: {purpose}")
-        self.sequences = [p for p in all_sequences if keep(p)]
+            raise ValueError(f"Unknown split_mode: {self.split_mode!r}")
+
         if not self.sequences:
             raise RuntimeError(
-                f"No sequences left for purpose={purpose!r} with held_out={held_out_subject!r}"
+                f"No sequences left for purpose={purpose!r} (split_mode={self.split_mode}, "
+                f"held_out={held_out_subject!r})"
             )
 
         # Lazy per-sequence handles, populated on first access in __getitem__.
