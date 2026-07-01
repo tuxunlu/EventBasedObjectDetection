@@ -272,12 +272,20 @@ class EventDistillationLoss(nn.Module):
             self._pos_weight = None
 
     # --------------------------------------------------------------- terms
-    def _ce(self, logits, labels):
-        return F.binary_cross_entropy_with_logits(
+    @staticmethod
+    def _wmean(per_event, weight):
+        """Mean, or per-event-weighted mean when ``weight`` (same shape) is given."""
+        if weight is None:
+            return per_event.mean()
+        return (per_event * weight).sum() / weight.sum().clamp_min(1e-6)
+
+    def _ce(self, logits, labels, weight=None):
+        per = F.binary_cross_entropy_with_logits(
             logits, labels,
             pos_weight=self._pos_weight if self._pos_weight is not None else None,
-            reduction="mean",
+            reduction="none",
         )
+        return self._wmean(per, weight)
 
     def _rce(self, logits, labels):
         """Reverse cross-entropy: treat the prediction as 'truth', the label as 'pred'."""
@@ -305,13 +313,14 @@ class EventDistillationLoss(nn.Module):
         inter = (p * labels).sum()
         return 1.0 - (2.0 * inter + eps) / (p.sum() + labels.sum() + eps)
 
-    def _posweight(self, per_event, labels):
-        """Apply the optional per-event class weight ``1+(pos_weight-1)·y`` and mean."""
+    def _posweight(self, per_event, labels, weight=None):
+        """Apply the optional per-event class weight ``1+(pos_weight-1)·y``, then mean
+        (or per-event-weighted mean when ``weight`` is given)."""
         if self._pos_weight is not None:
             per_event = per_event * (1.0 + (self._pos_weight - 1.0) * labels)
-        return per_event.mean()
+        return self._wmean(per_event, weight)
 
-    def _gce(self, logits, labels):
+    def _gce(self, logits, labels, weight=None):
         """Generalized Cross-Entropy / L_q (Zhang & Sabuncu, NeurIPS 2018)."""
         eps = self.sce_clip
         p = torch.sigmoid(logits)
@@ -322,9 +331,9 @@ class EventDistillationLoss(nn.Module):
             k = self.gce_truncate
             const = (1.0 - k ** q) / q
             loss = torch.where(p_t < k, torch.full_like(loss, const), loss)
-        return self._posweight(loss, labels)
+        return self._posweight(loss, labels, weight)
 
-    def _gjs(self, logits, labels):
+    def _gjs(self, logits, labels, weight=None):
         """Generalized Jensen-Shannon (M=2) noisy-label loss (Englesson NeurIPS 2021).
 
         Interpolates CE↔MAE via ``pi1``; symmetric and bounded. For binary, the
@@ -345,7 +354,7 @@ class EventDistillationLoss(nn.Module):
         kl_P = P0 * torch.log(P0 / m0) + P1 * torch.log(P1 / m1)
         Z = -(1.0 - pi) * math.log(1.0 - pi)
         loss = (pi * kl_Y + (1.0 - pi) * kl_P) / Z
-        return self._posweight(loss, labels)
+        return self._posweight(loss, labels, weight)
 
     def _nr_dice(self, logits, labels, batch_idx, eps=1e-5):
         """Noise-Robust Dice (Wang et al., COPLE-Net, IEEE TMI 2020), per sample."""
@@ -360,17 +369,21 @@ class EventDistillationLoss(nn.Module):
         present = torch.unique(batch_idx)
         return (num[present] / den[present]).mean()
 
-    def _asl(self, logits, labels, eps=1e-6):
+    def _asl(self, logits, labels, weight=None, eps=1e-6):
         """Asymmetric Loss (Ben-Baruch et al., ICCV 2021); per-event independent binary."""
         p = torch.sigmoid(logits)
         l_pos = (1.0 - p).clamp_min(0.0).pow(self.asl_gamma_pos) * torch.log(p.clamp_min(eps))
         p_m = (p - self.asl_clip).clamp_min(0.0)                  # probability-shifted neg
         l_neg = p_m.pow(self.asl_gamma_neg) * torch.log((1.0 - p_m).clamp_min(eps))
         loss = -(labels * l_pos + (1.0 - labels) * l_neg)
-        return loss.mean()
+        return self._wmean(loss, weight)
 
     # --------------------------------------------------------------- forward
-    def forward(self, logits, labels, batch_idx=None) -> Dict[str, torch.Tensor]:
+    def forward(self, logits, labels, batch_idx=None, weight=None) -> Dict[str, torch.Tensor]:
+        """``weight`` (optional, ``(N,)``) up/down-weights individual events in the
+        *pointwise* terms (CE/GJS/GCE/ASL) — e.g. boundary emphasis. The set-level
+        Lovász/Dice/Tversky terms stay unweighted (they are per-sample IoU surrogates).
+        It is filtered by the same ignore mask as the logits/labels."""
         logits = _flatten_logits(logits)
         labels = labels.float()
 
@@ -378,6 +391,7 @@ class EventDistillationLoss(nn.Module):
             keep = labels >= 0
             logits, labels = logits[keep], labels[keep]
             batch_idx = batch_idx[keep] if batch_idx is not None else None
+            weight = weight[keep] if weight is not None else None
 
         terms: Dict[str, torch.Tensor] = {}
         if logits.numel() == 0:
@@ -390,7 +404,7 @@ class EventDistillationLoss(nn.Module):
         if self.label_smoothing > 0.0:
             tgt = labels * (1.0 - self.label_smoothing) + 0.5 * self.label_smoothing
 
-        ce = self._ce(logits, tgt)
+        ce = self._ce(logits, tgt, weight)
         terms["bce"] = ce
         if self.sce_beta > 0.0:
             rce = self._rce(logits, labels)
@@ -403,11 +417,11 @@ class EventDistillationLoss(nn.Module):
         # Noise-robust pointwise alternatives (each replaces the SCE block when its
         # config sets bce_weight=0); see class docstring for the references.
         if self.gce_weight > 0.0:
-            terms["gce"] = self._gce(logits, labels)
+            terms["gce"] = self._gce(logits, labels, weight)
             total = total + self.gce_weight * terms["gce"]
 
         if self.gjs_weight > 0.0:
-            terms["gjs"] = self._gjs(logits, labels)
+            terms["gjs"] = self._gjs(logits, labels, weight)
             total = total + self.gjs_weight * terms["gjs"]
 
         if self.nrdice_weight > 0.0:
@@ -415,7 +429,7 @@ class EventDistillationLoss(nn.Module):
             total = total + self.nrdice_weight * terms["nrdice"]
 
         if self.asl_weight > 0.0:
-            terms["asl"] = self._asl(logits, labels)
+            terms["asl"] = self._asl(logits, labels, weight)
             total = total + self.asl_weight * terms["asl"]
 
         if self.lovasz_weight > 0.0:

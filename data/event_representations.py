@@ -52,18 +52,32 @@ def voxel_grid(
     width: int,
     device: torch.device | str = "cpu",
     signed: bool = True,
+    split_polarity: bool = False,
 ) -> torch.Tensor:
     """Zhu et al. 2019 voxel grid with bilinear temporal interpolation.
 
+    Parameters
+    ----------
+    split_polarity
+        If True, keep ON and OFF events in separate channel blocks instead of
+        accumulating them into one signed value per (bin, pixel) — where
+        opposite polarities cancel and the ON/OFF leading/trailing-edge
+        structure (the motion-direction cue) is lost. Output becomes
+        ``(2*bins, height, width)``: channels ``[0:bins]`` hold positive-event
+        counts, ``[bins:2*bins]`` negative-event counts, each bilinearly
+        interpolated across time bins. ``signed`` is ignored in this mode
+        (both blocks are non-negative counts).
+
     Returns
     -------
-    Tensor of shape (bins, height, width), float32. Each event contributes its
-    polarity (signed) or 1.0 (unsigned) bilinearly to the two surrounding time
-    bins.
+    Tensor of shape (bins, height, width) — or (2*bins, height, width) when
+    ``split_polarity`` — float32. Each event contributes its polarity (signed)
+    or 1.0 (unsigned / split) bilinearly to the two surrounding time bins.
     """
     device = torch.device(device)
     if t_end <= t_start:
         raise ValueError(f"t_end ({t_end}) must be > t_start ({t_start})")
+    n_ch = 2 * bins if split_polarity else bins
 
     t_t, x, y, pol = _prepare(t, xy, p, device)
     in_bounds = (
@@ -74,10 +88,14 @@ def voxel_grid(
     t_t = t_t[in_bounds]
     x = x[in_bounds]
     y = y[in_bounds]
-    pol = pol[in_bounds] if signed else torch.ones_like(pol[in_bounds])
+    pol = pol[in_bounds]
+    if split_polarity or not signed:
+        val = torch.ones_like(pol)
+    else:
+        val = pol
 
     if t_t.numel() == 0:
-        return torch.zeros((bins, height, width), dtype=torch.float32, device=device)
+        return torch.zeros((n_ch, height, width), dtype=torch.float32, device=device)
 
     # Normalise time to [0, bins-1] for bilinear interpolation across bins.
     t_norm = ((t_t - t_start) / (t_end - t_start) * (bins - 1)).to(torch.float32)
@@ -86,12 +104,22 @@ def voxel_grid(
     w_hi = t_norm - t_lo.to(torch.float32)
     w_lo = 1.0 - w_hi
 
-    grid = torch.zeros((bins, height, width), dtype=torch.float32, device=device)
-    flat = grid.view(bins, -1)
+    if split_polarity:
+        # Route each event to its polarity's channel block: ON → [0:bins],
+        # OFF → [bins:2*bins].
+        ch_off = torch.where(pol > 0, torch.zeros_like(t_lo),
+                             torch.full_like(t_lo, bins))
+        c_lo = t_lo + ch_off
+        c_hi = t_hi + ch_off
+    else:
+        c_lo, c_hi = t_lo, t_hi
+
+    grid = torch.zeros((n_ch, height, width), dtype=torch.float32, device=device)
+    flat = grid.view(n_ch, -1)
 
     lin = (y * width + x).long()
-    flat.index_put_((t_lo, lin), pol * w_lo, accumulate=True)
-    flat.index_put_((t_hi, lin), pol * w_hi, accumulate=True)
+    flat.index_put_((c_lo, lin), val * w_lo, accumulate=True)
+    flat.index_put_((c_hi, lin), val * w_hi, accumulate=True)
 
     return grid
 

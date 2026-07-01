@@ -26,16 +26,27 @@ import torch
 _GRAY = 128
 
 
-def events_panel_from_voxel(voxel: torch.Tensor) -> np.ndarray:
-    """Signed voxel ``(B, H, W)`` → BGR panel: gray bg, red/blue net polarity.
+def events_panel_from_voxel(voxel: torch.Tensor,
+                            split_polarity: bool = False) -> np.ndarray:
+    """Voxel ``(B, H, W)`` → BGR panel: gray bg, red/blue net polarity.
 
     The voxel bins are summed to a single signed accumulation map; a pixel is
     drawn red where the net event polarity over the window is positive and blue
     where it is negative. This visualizes exactly the input the student saw
     (rather than re-reading raw events), so the panel and the prediction are
     always aligned.
+
+    ``split_polarity``: set True for the two-channel-per-polarity voxel layout
+    (dataset ``polarity_mode="two_channel"``): channels ``[0:B/2]`` hold ON
+    counts and ``[B/2:]`` OFF counts, so the net map is their difference
+    (the default single-block sum would always be non-negative).
     """
-    acc = voxel.sum(dim=0).detach().cpu().numpy()  # (H, W), signed
+    v = voxel.detach().cpu()
+    if split_polarity:
+        half = v.shape[0] // 2
+        acc = (v[:half].sum(dim=0) - v[half:].sum(dim=0)).numpy()
+    else:
+        acc = v.sum(dim=0).numpy()  # (H, W), signed
     h, w = acc.shape
     img = np.full((h, w, 3), _GRAY, dtype=np.uint8)
     img[acc > 0] = (0, 0, 255)   # BGR red  = positive polarity

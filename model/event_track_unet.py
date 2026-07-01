@@ -43,8 +43,16 @@ For true online tracking over an arbitrarily long stream use ``step``:
     for frame in stream:                      # frame: (B, C, H, W)
         logits, state = model.step(frame, state)
 
-``C == in_channels == voxel_bins``. The mask feedback / hidden state are kept at
-full and bottleneck resolution respectively, so there is no resolution mismatch.
+``C == in_channels`` must match the dataset's voxel layout: ``voxel_bins`` for
+the legacy signed voxel (ON/OFF summed as ±1 into one channel per bin — opposite
+polarities at a pixel/bin cancel), or ``2 * voxel_bins`` for the two-channel
+polarity voxel (dataset ``polarity_mode="two_channel"``: ON counts in the first
+``voxel_bins`` channels, OFF counts in the rest). The two-channel form preserves
+the ON/OFF leading/trailing-edge structure — the motion-direction cue polarity
+carries — at the cost of only a wider stem-conv input (a few thousand extra
+params, first layer only), so the low-power/latency budget is unchanged. The
+mask feedback / hidden state are kept at full and bottleneck resolution
+respectively, so there is no resolution mismatch.
 """
 
 from __future__ import annotations
@@ -261,17 +269,19 @@ class EventTrackUnet(nn.Module):
 
 
 if __name__ == "__main__":
-    # Smoke test: clip + single-frame + streaming shape contracts and param count.
-    model = EventTrackUnet(in_channels=5, encoder_channels=(48, 96, 128, 160),
+    # Smoke test: clip + single-frame + streaming shape contracts and param count,
+    # in the two-channel polarity layout (in_channels = 2 * voxel_bins = 10;
+    # ON/OFF counts are non-negative, hence relu on the random input).
+    model = EventTrackUnet(in_channels=10, encoder_channels=(48, 96, 128, 160),
                            num_classes=1, norm="gn", gn_groups=8)
     model.eval()
 
-    clip = torch.randn(2, 4, 5, 120, 160)
+    clip = torch.randn(2, 4, 10, 120, 160).relu()
     with torch.no_grad():
         out = model(clip)
     assert out.shape == (2, 4, 1, 120, 160), out.shape
 
-    frame = torch.randn(2, 5, 120, 160)
+    frame = torch.randn(2, 10, 120, 160).relu()
     with torch.no_grad():
         out1 = model(frame)
     assert out1.shape == (2, 1, 120, 160), out1.shape
@@ -281,5 +291,21 @@ if __name__ == "__main__":
         l0, st = model.step(clip[:, 0], None)
     assert torch.allclose(l0, out[:, 0], atol=1e-5)
 
+    # Gradients flow through the recurrent unroll on the two-channel input.
+    model.train()
+    loss = model(clip).mean()
+    loss.backward()
+    stem_w = model.stem[0].weight
+    assert stem_w.grad is not None and torch.isfinite(stem_w.grad).all()
+
+    # Legacy signed voxel stays supported via in_channels = voxel_bins.
+    legacy = EventTrackUnet(in_channels=5, encoder_channels=(48, 96, 128, 160),
+                            num_classes=1, norm="gn", gn_groups=8)
+    legacy.eval()
+    with torch.no_grad():
+        out5 = legacy(torch.randn(2, 5, 120, 160))
+    assert out5.shape == (2, 1, 120, 160), out5.shape
+
     print(f"clip {tuple(out.shape)} | frame {tuple(out1.shape)} | "
-          f"params: {count_parameters(model):,}")
+          f"params(10ch): {count_parameters(model):,} | "
+          f"params(5ch): {count_parameters(legacy):,}")

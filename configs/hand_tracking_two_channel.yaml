@@ -1,0 +1,161 @@
+# Phase B tracking on the OLD DVS dataset (NatureRoboticsDataNew), TWO-CHANNEL
+# POLARITY ablation of hand_tracking.yaml: HandEventClipDataset + EventTrackUnet
+# with BCE+Dice distillation on the cached SAM 2 masks + the static-region
+# anti-flicker penalty.
+#
+# ONLY differences vs hand_tracking.yaml (the signed baseline):
+#   - DATA  polarity_mode: two_channel — ON and OFF events land in separate
+#     count-channel blocks per time bin (voxel = 2*voxel_bins channels) instead
+#     of accumulating as ±1 into one channel, where opposite polarities at the
+#     same pixel/bin cancel and the ON-leading/OFF-trailing edge structure (the
+#     motion-direction cue polarity carries) is lost to the model.
+#   - MODEL in_channels: 20 (= 2 * voxel_bins) — the only architectural cost is
+#     a wider stem-conv input (~4k params at these widths); everything
+#     downstream, and therefore latency/power, is unchanged.
+#
+# The trained 20260605 checkpoint and its inference config
+# (hand_tracking_5bins_36ms.yaml) use the signed layout — do NOT point this
+# config's warm-start at that checkpoint (the stem shape differs).
+
+TRAINING:
+  deterministic: False
+  use_compile: False
+  inference_mode: False
+  seed: 42
+  max_epochs: 50
+  num_sanity_val_steps: 0
+  task: tracking
+  # BCE positive-class weight for the cached-mask loss. null = off. Raise to
+  # ~5-20 if val_iou stalls because the model collapses to all-zero masks.
+  seg_pos_weight: null
+  # Static-region temporal-consistency (anti-flicker) penalty weight. Penalizes
+  # prediction changes across consecutive clip frames at pixels with no events.
+  temporal_consistency_weight: 0.5
+  # One stateful preview video per rank at each validation epoch.
+  val_preview_count: 4
+
+DISTRIBUTED:
+  accelerator: gpu
+  devices: 4
+  num_nodes: 1
+  strategy: auto
+
+DATA:
+  dataset:
+    file_name: hand_event_clip_dataset
+    class_name: HandEventClipDataset
+    dataset_init_args:
+      root_dir: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNew
+      voxel_bins: 10                # time bins; two_channel doubles the voxel channels
+      # Separate ON/OFF count channels per bin — see the header comment. The
+      # net map (ON block - OFF block) equals the legacy signed voxel exactly,
+      # so this input is a strict superset of the baseline's information.
+      polarity_mode: two_channel
+      window_ms: 18.0
+      image_height: 240
+      image_width: 320
+      held_out_subject: tuxun       # LOSO held-out subject for val/test
+      require_teacher: True         # set False before running sam2_pseudo_labels.py
+      action_only: True
+      mask_root: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNewTeacherMasks   # complete SAM 2 teacher masks
+      provide_rgb: False
+      num_classes: 1
+      # Temporal clip window: T consecutive kept frames per sample; the
+      # recurrent memory is unrolled (and BPTT'd) over clip_len frames.
+      # clip_stride 4 = 50% overlap at clip_len 8.
+      clip_len: 8
+      clip_stride: 4
+      # Train-only spatial augmentation, applied IDENTICALLY across a clip's
+      # frames so the random flip/affine never breaks temporal coherence.
+      augmentation:
+        enabled: True
+        hflip_prob: 0.5
+        affine_prob: 0.5
+        rotate_deg: 10.0
+        scale_range: [0.9, 1.1]
+        translate_frac: 0.05
+  dataloader:
+    # Clips are clip_len times larger than frames in memory, and the recurrent
+    # unroll stores per-frame activations for BPTT — keep the clip batch small.
+    # MEASURED (fp32, one train step, 240x320, clip_len 8): batch 4 peaks ~34 GiB
+    # and batch 3 also OOMs on a 24 GB RTX A5000 (tron nodes); batch 2 peaks
+    # 17.2 GiB. The signed baseline only fit batch 4 because it ran on 48 GB
+    # L40S (gammagpu18). batch 2 + gradient_accumulation 2 (below) keeps the
+    # effective global batch at 4 GPUs x 2 x 2 = 16, matching the baseline.
+    batch_size: 2
+    test_batch_size: 2
+    num_workers: 8
+    persistent_workers: True
+    pin_memory: True
+    multiprocessing_context: fork
+    drop_last: True
+    shuffle_train: True
+    shuffle_val: False
+    shuffle_test: False
+
+MODEL:
+  file_name: event_track_unet
+  class_name: EventTrackUnet
+  model_init_args:
+    in_channels: 20                 # = 2 * voxel_bins (polarity_mode: two_channel)
+    # Same backbone widths as the per-frame EventUnet (~0.65M) plus the ConvGRU
+    # memory (~0.15M) → ~0.8M params total.
+    encoder_channels: [48, 96, 128, 160]
+    num_classes: 1
+    # GroupNorm (no running stats) preferred under the LOSO split, as in EventUnet.
+    norm: gn
+    gn_groups: 8
+    use_se: True
+    use_context: True
+    context_dilations: [1, 2, 4]
+    # Concatenate the previous frame's predicted mask probability as an extra
+    # input channel (SAM2-style mask conditioning).
+    use_prev_mask: True
+
+OPTIMIZER:
+  name: AdamW
+  arguments:
+    lr: 3e-4
+    weight_decay: 1e-4
+  gradient_accumulation:
+    # Constant x2 accumulation compensates the batch 4 -> 2 reduction needed to
+    # fit a 24 GB A5000 (see the dataloader comment); GroupNorm makes the
+    # smaller per-step batch statistically safe.
+    enabled: True
+    scheduling: {0: 2}
+  gradient_clip:
+    # Recurrent unroll → keep gradient clipping on to tame BPTT spikes.
+    enabled: True
+    gradient_clip_val: 1.0
+    gradient_clip_algorithm: norm
+  stochastic_weight_averaging:
+    enabled: False
+    swa_lrs: 1e-2
+
+SCHEDULER:
+  learning_rate:
+    enabled: True
+    name: CosineAnnealingLR
+    arguments:
+      T_max: 50
+      eta_min: 1e-6
+  early_stopping:
+    enabled: False
+    monitor: val_loss_epoch
+    mode: min
+    patience: 5
+    min_delta: 1e-5
+
+LOGGER:
+  log_dir_root: lightning_logs
+  experiment_name: hand_tracking_phaseB_eventtrackunet_10bins_18ms_2chpol
+
+CHECKPOINT:
+  enabled: True
+  every_n_epochs: 1
+  # Tracking: highest mIoU wins (val_flicker is also logged for steadiness).
+  monitor: val_iou_epoch
+  mode: max
+  filename: "best-{epoch:03d}-{val_iou_epoch:.4f}"
+  save_top_k: 1
+  save_last: True

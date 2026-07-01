@@ -4,7 +4,7 @@ Where ``HandEventDataset`` yields independent ``(voxel, mask, meta)`` frames,
 this yields **ordered clips** of ``clip_len`` consecutive (kept) frames from a
 single sequence:
 
-    voxel : (T, C, H, W)      C == voxel_bins
+    voxel : (T, C, H, W)      C == voxel_bins (2*voxel_bins when polarity_mode="two_channel")
     mask  : (T, H, W)
     meta  : {"sequence", "frame_indices", ...}
 
@@ -66,6 +66,7 @@ class HandEventClipDataset(HandEventDataset):
         mask_root: Optional[str] = None,
         augmentation: Optional[Dict[str, Any]] = None,
         provide_rgb: bool = False,
+        polarity_mode: str = "signed",
         clip_len: int = 8,
         clip_stride: int = 1,
     ):
@@ -82,6 +83,7 @@ class HandEventClipDataset(HandEventDataset):
             mask_root=mask_root,
             augmentation=augmentation,
             provide_rgb=provide_rgb,
+            polarity_mode=polarity_mode,
         )
         self.clip_len = int(clip_len)
         self.clip_stride = max(1, int(clip_stride))

@@ -64,6 +64,8 @@ class HandEventStreamDataset(HandEventDataset):
         boundary_ignore_px: int = 0,
         time_ignore_frac: float = 0.0,
         time_ignore_val: bool = False,
+        label_mode: str = "center",
+        max_label_frames: int = 5,
         split_mode: str = "loso",
         val_frac: float = 0.1,
         test_frac: float = 0.1,
@@ -123,6 +125,22 @@ class HandEventStreamDataset(HandEventDataset):
             and (self.boundary_ignore_px > 0 or self.time_ignore_frac > 0.0)
         )
 
+        # --- Motion-compensated (nearest-frame) labels --------------------------------
+        # ``center`` (default): every event's label = the SINGLE center-frame SAM 2 mask
+        # ``mask[y,x]`` — over a ``window_ms`` window the moving hand edge sweeps across
+        # pixels, so events at the window extremes are mislabeled (the root cause of the
+        # fuzzy edge under fast motion). ``nearest_frame``: each event is labeled by the
+        # teacher mask of the FLIR frame NEAREST its OWN timestamp (a discrete
+        # motion-compensation), de-smearing the boundary supervision. Applied at all
+        # stages so train and val targets stay consistent; falls back to the center frame
+        # for events whose nearest neighbor frame has no cached mask. ``max_label_frames``
+        # bounds the per-window mask loads (closest-to-center kept).
+        self.label_mode = str(label_mode).strip().lower()
+        if self.label_mode not in ("center", "nearest_frame"):
+            raise ValueError(
+                f"label_mode must be center|nearest_frame, got {label_mode!r}")
+        self._max_label_frames = max(1, int(max_label_frames))
+
     # ------------------------------------------------------------------ helpers
 
     def _load_mask(self, handle: dict, f_idx: int) -> torch.Tensor:
@@ -163,6 +181,36 @@ class HandEventStreamDataset(HandEventDataset):
         label_map[band] = -1.0
         return torch.from_numpy(label_map)
 
+    def _nearest_frame_masks(self, h, f_idx, t_center, t_start, t_end, center_mask):
+        """For ``label_mode='nearest_frame'``: stack the (trimap) teacher masks of the
+        FLIR frames within the window so each event can be labeled by its nearest-in-time
+        frame. Returns ``(frame_masks (K,H,W) float, frame_times (K,) float64)`` or
+        ``(None, None)`` when nearest-frame labeling is off or only the center frame has a
+        cached mask (then the caller uses the plain single-frame path)."""
+        if self.label_mode != "nearest_frame":
+            return None, None
+        flir_t = np.asarray(h["flir_t"])
+        j_lo = int(np.searchsorted(flir_t, t_start, side="left"))
+        j_hi = int(np.searchsorted(flir_t, t_end, side="right"))
+        cand = sorted((set(range(j_lo, j_hi)) | {f_idx}))
+        cand = [c for c in cand if 0 <= c < len(flir_t)]
+        if len(cand) > self._max_label_frames:                       # keep closest to centre
+            cand = sorted(sorted(cand, key=lambda c: abs(float(flir_t[c]) - t_center))
+                          [:self._max_label_frames])
+        maps, times = [], []
+        for j in cand:
+            if j == f_idx:
+                mj = center_mask
+            else:
+                if not (h["mask_dir"] / f"{j:06d}.png").exists():
+                    continue
+                mj = self._load_mask(h, j)
+            maps.append(self._build_label_map(mj) if self._label_refine_active else mj)
+            times.append(float(flir_t[j]))
+        if len(maps) <= 1:                                           # only centre available
+            return None, None
+        return torch.stack(maps, dim=0), np.asarray(times, dtype=np.float64)
+
     def _empty_sample(self):
         return (
             torch.zeros((0, 2), dtype=torch.long),
@@ -179,6 +227,8 @@ class HandEventStreamDataset(HandEventDataset):
         t_start: float,
         t_end: float,
         mask: torch.Tensor,
+        frame_masks: torch.Tensor = None,
+        frame_times: np.ndarray = None,
     ):
         """Vectorized: raw events -> per-event (coords, feats, times, labels). No merge.
 
@@ -220,10 +270,24 @@ class HandEventStreamDataset(HandEventDataset):
         coords = torch.stack([x, y], dim=1)                         # (N, 2) (x, y)
         feats = torch.stack([pol, t_norm], dim=1)                   # (N, 2) per event
 
-        # Per-event target. With label refinement on (train only) sample from the
-        # trimap label map (mask edge -> -1) and additionally ignore events far from
-        # the window centre, where the single-frame mask is most misaligned.
-        if self._label_refine_active:
+        # Per-event target.
+        #  * nearest_frame (frame_masks given): label each event from the FLIR frame
+        #    nearest its OWN timestamp — discrete motion-compensation that de-smears the
+        #    moving boundary. ``frame_masks`` already carry the boundary trimap when
+        #    refinement is active.
+        #  * else with label refinement on (train only): sample from the single-frame
+        #    trimap label map (mask edge -> -1).
+        #  * else: the raw single-frame mask.
+        # In all refined cases, additionally ignore events far from the window centre.
+        if frame_masks is not None:
+            ftt = torch.as_tensor(np.asarray(frame_times), dtype=torch.float64)   # (K,)
+            choice = (t_t.view(-1, 1) - ftt.view(1, -1)).abs().argmin(dim=1)      # (N,)
+            labels = frame_masks[choice, y, x].to(torch.float32)                  # (N,)
+            if self._label_refine_active and self.time_ignore_frac > 0.0:
+                f = min(self.time_ignore_frac, 0.49)
+                far = (t_norm < f) | (t_norm > 1.0 - f)
+                labels = labels.masked_fill(far, -1.0)
+        elif self._label_refine_active:
             label_map = self._build_label_map(mask)
             labels = label_map[y, x].to(torch.float32)
             if self.time_ignore_frac > 0.0:
@@ -254,7 +318,10 @@ class HandEventStreamDataset(HandEventDataset):
         p = np.asarray(h["events_p"][lo:hi])
 
         mask = self._load_mask(h, f_idx)
-        coords, feats, times, labels = self._build_events(t, xy, p, t_start, t_end, mask)
+        frame_masks, frame_times = self._nearest_frame_masks(
+            h, f_idx, t_center, t_start, t_end, mask)
+        coords, feats, times, labels = self._build_events(
+            t, xy, p, t_start, t_end, mask, frame_masks, frame_times)
 
         if self._event_aug_active and coords.shape[0] > 0:
             # Per-sample generator: idx mixes in the worker's running global RNG so

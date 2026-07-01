@@ -147,9 +147,19 @@ class HandEventDataset(data.Dataset):
         the RGB stream to align student event-domain features with the teacher.
         The sample becomes a 4-tuple ``(voxel, mask, rgb, meta)``; default 3-tuple
         contract is preserved when False.
-    """
+    polarity_mode : {"signed", "two_channel"}
+        How event polarity enters the voxel grid.
 
-    POLARITY_MODE = "signed"  # voxel grid in [-1, 1] sense
+        ``"signed"`` (default, matches all pre-existing checkpoints): ON/OFF
+        events accumulate as +1/-1 into ONE channel per time bin — opposite
+        polarities at the same pixel/bin cancel, discarding the ON/OFF
+        leading/trailing-edge structure that encodes motion direction.
+
+        ``"two_channel"``: ON and OFF counts land in separate channel blocks
+        → voxel shape ``(2*voxel_bins, H, W)`` (``[0:bins]`` = ON,
+        ``[bins:]`` = OFF, non-negative counts). The consuming model's
+        ``in_channels`` must be ``2*voxel_bins`` (see ``voxel_channels``).
+    """
 
     def __init__(
         self,
@@ -165,6 +175,7 @@ class HandEventDataset(data.Dataset):
         mask_root: Optional[str] = None,
         augmentation: Optional[Dict[str, Any]] = None,
         provide_rgb: bool = False,
+        polarity_mode: str = "signed",
         split_mode: str = "loso",
         val_frac: float = 0.1,
         test_frac: float = 0.1,
@@ -176,6 +187,11 @@ class HandEventDataset(data.Dataset):
             raise FileNotFoundError(f"root_dir does not exist: {self.root}")
         self.purpose = purpose
         self.voxel_bins = voxel_bins
+        self.polarity_mode = str(polarity_mode).lower()
+        if self.polarity_mode not in ("signed", "two_channel"):
+            raise ValueError(
+                f"polarity_mode must be 'signed' or 'two_channel', got {polarity_mode!r}"
+            )
         self.window_ms = window_ms
         self.image_height = image_height
         self.image_width = image_width
@@ -279,6 +295,12 @@ class HandEventDataset(data.Dataset):
             )
 
     # ------------------------------------------------------------------ utils
+
+    @property
+    def voxel_channels(self) -> int:
+        """Channels of the emitted voxel = the model's ``in_channels``:
+        ``voxel_bins``, doubled in ``two_channel`` polarity mode."""
+        return self.voxel_bins * (2 if self.polarity_mode == "two_channel" else 1)
 
     def _detect_native_resolution(self) -> Tuple[int, int]:
         """Read a single FLIR PNG header to discover the sensor resolution."""
@@ -401,6 +423,7 @@ class HandEventDataset(data.Dataset):
             bins=self.voxel_bins,
             height=self.image_height, width=self.image_width,
             device="cpu", signed=True,
+            split_polarity=self.polarity_mode == "two_channel",
         )
 
         mask_path = h["mask_dir"] / f"{f_idx:06d}.png"
@@ -433,6 +456,51 @@ class HandEventDataset(data.Dataset):
             rgb = torch.from_numpy(rgb_img).permute(2, 0, 1).contiguous().float() / 255.0
 
         return voxel, mask, rgb, hi - lo, t_center
+
+    def frame_events(self, pos: int) -> Dict[str, np.ndarray]:
+        """Raw per-event ``(x, y, t, p)`` for frame ``pos`` (index into
+        ``self.index``), with TRUE continuous timestamps.
+
+        Mirrors the windowing and spatial rescale in :meth:`_load_frame` exactly,
+        so the returned events are precisely those that were voxelized into the
+        model's input — but kept as individual events instead of binned. Intended
+        for the ``(x, y, t)`` volume preview, which otherwise has to reconstruct
+        time from the coarse voxel bins (only ``voxel_bins`` discrete planes).
+
+        Returns float arrays on the model's ``(image_height, image_width)`` grid:
+        ``x``/``y`` pixel coords, ``t`` in-window time normalized to ``[0, 1]``
+        (``t_start`` → 0, ``t_end`` → 1), ``p`` signed polarity (+1 / -1, matching
+        ``voxel_grid``'s ``p > 0`` convention). Arrays are empty if the window has
+        no events.
+        """
+        s_idx, f_idx = self.index[pos]
+        seq_dir = self.sequences[s_idx]
+        h = self._get_handle(seq_dir)
+        t_center = float(h["flir_t"][f_idx])
+        half = (self.window_ms / 1000.0) * h["unit"] / 2.0
+        t_start, t_end = t_center - half, t_center + half
+
+        events_t = h["events_t"]
+        lo = int(np.searchsorted(events_t, t_start, side="left"))
+        hi = int(np.searchsorted(events_t, t_end, side="right"))
+        t_slice = np.asarray(events_t[lo:hi], dtype=np.float64)
+        xy = np.asarray(h["events_xy"][lo:hi]).astype(np.float64)
+        p = np.asarray(h["events_p"][lo:hi])
+
+        if xy.size == 0:
+            empty = np.zeros(0, dtype=np.float64)
+            return {"x": empty, "y": empty, "t": empty.copy(), "p": empty.copy()}
+
+        if self._needs_rescale:
+            xy[:, 0] *= self._scale_x
+            xy[:, 1] *= self._scale_y
+        span = (t_end - t_start) or 1.0
+        return {
+            "x": xy[:, 0],
+            "y": xy[:, 1],
+            "t": (t_slice - t_start) / span,
+            "p": np.where(np.asarray(p) > 0, 1.0, -1.0),
+        }
 
     def __getitem__(self, idx: int):
         s_idx, f_idx = self.index[idx]

@@ -335,6 +335,9 @@ class ModelInterface(pl.LightningModule):
         # so it exposes frame_sample() for one-frame access; the plain seg dataset
         # returns single frames from __getitem__ directly.
         frame_getter = getattr(val_set, "frame_sample", None) or val_set.__getitem__
+        # Two-channel-per-polarity voxels need the ON-OFF difference for the
+        # red/blue net-polarity panel (a plain channel sum is non-negative).
+        split_pol = getattr(val_set, "polarity_mode", "signed") == "two_channel"
         # Tracking models expose step(frame, state) for stateful streaming; run
         # the whole sequence through one carried state so the preview reflects
         # the temporal memory (per-frame call for the stateless seg model).
@@ -356,7 +359,8 @@ class ModelInterface(pl.LightningModule):
                 prob = torch.sigmoid(logits)[0, 0]
                 pred = (prob > 0.5).float()
 
-                event_panels.append(events_panel_from_voxel(voxel))
+                event_panels.append(
+                    events_panel_from_voxel(voxel, split_polarity=split_pol))
                 gt_np = (mask.detach().cpu().numpy() * 255).astype("uint8")
                 gt_masks.append(gt_np)
                 pred_masks.append((pred.cpu().numpy() * 255).astype("uint8"))
@@ -724,7 +728,41 @@ class ModelInterface(pl.LightningModule):
             return None                      # nothing to supervise this batch
         bs = batch.batch_size
 
-        terms = self.event_loss(logits, labels, batch_idx=batch.batch_idx)
+        # Boundary-emphasis per-event loss weight (TRAIN ONLY). Up-weight events near the
+        # teacher-mask boundary so the rare edge events — the ones fast motion displaces —
+        # aren't drowned by the interior/background majority. The band is derived from the
+        # AUGMENTED per-event labels (rasterized fg/bg presence + a maxpool dilation), NOT
+        # batch.dense_mask, which is left un-augmented and would be misaligned under
+        # hflip/affine (same reason the aux head rebuilds its target from labels). An event
+        # is "near boundary" iff within ±band px there is BOTH a fg and a bg event — robust
+        # to the sparse/holey event map. Reads band/weight from the model so it is
+        # config-bindable; default off. Only coherent on de-noised labels (boundary_ignore
+        # / nearest-frame), per the EventDistillationLoss noise warning.
+        loss_weight = None
+        bw = float(getattr(self.model, "boundary_loss_weight", 1.0))
+        bband = int(getattr(self.model, "boundary_loss_band", 0))
+        if stage == "train" and bband > 0 and bw != 1.0:
+            import torch.nn.functional as F
+            H, W = int(batch.height), int(batch.width)
+            xb = batch.coords[:, 0].long().clamp(0, W - 1)
+            yb = batch.coords[:, 1].long().clamp(0, H - 1)
+            bb = batch.batch_idx.long()
+            flat = (bb * H + yb) * W + xb
+            fgv = (labels > 0.5).to(logits.dtype)
+            bgv = ((labels >= 0) & (labels <= 0.5)).to(logits.dtype)
+            fg_px = logits.new_zeros(bs * H * W).index_add_(0, flat, fgv).view(bs, 1, H, W)
+            bg_px = logits.new_zeros(bs * H * W).index_add_(0, flat, bgv).view(bs, 1, H, W)
+            k = 2 * bband + 1
+            fg_near = F.max_pool2d((fg_px > 0).to(logits.dtype), k, 1, bband)
+            bg_near = F.max_pool2d((bg_px > 0).to(logits.dtype), k, 1, bband)
+            boundary = ((fg_near > 0.5) & (bg_near > 0.5)).view(bs, H, W)
+            in_band = boundary[bb, yb, xb].to(logits.dtype)             # (N,)
+            loss_weight = 1.0 + (bw - 1.0) * in_band
+            self.log(f'{stage}_boundary_frac', in_band.mean(), on_step=True,
+                     on_epoch=True, prog_bar=False, sync_dist=True, batch_size=bs)
+
+        terms = self.event_loss(logits, labels, batch_idx=batch.batch_idx,
+                                weight=loss_weight)
         loss = terms["total"]
         # Auxiliary dense-shape head loss (TRAIN ONLY). The model stashes a coarse
         # (B,1,G,G) occupancy logit map on ``self.model._aux_logits``; supervise it
