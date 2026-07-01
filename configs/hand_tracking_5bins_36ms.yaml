@@ -1,0 +1,122 @@
+# Inference/preview config matching the 20260605 EventTrackUnet checkpoint
+# (lightning_logs/20260605-19-56-25-hand_tracking_phaseB_eventtrackunet).
+#
+# That checkpoint was trained with the model's ORIGINAL recipe (voxel_bins=5 ->
+# in_channels=5, +1 prev-mask channel = 6-channel stem; window_ms=36.0). The
+# main hand_tracking.yaml has since moved to voxel_bins=10 / window_ms=18.0, so
+# it no longer matches this checkpoint's stem (size mismatch on stem.0.weight).
+# Use THIS config to render previews for the 5-bin checkpoint; use
+# hand_tracking.yaml for the newer 10-bin runs. The two differ ONLY in
+# voxel_bins, window_ms, and in_channels. Values recovered from the checkpoint's
+# saved hyper_parameters.
+
+TRAINING:
+  deterministic: False
+  use_compile: False
+  inference_mode: False
+  seed: 42
+  max_epochs: 50
+  task: tracking
+  seg_pos_weight: null
+  temporal_consistency_weight: 0.5
+  val_preview_count: 4
+
+DISTRIBUTED:
+  accelerator: gpu
+  devices: 4
+  num_nodes: 1
+  strategy: auto
+
+DATA:
+  dataset:
+    file_name: hand_event_clip_dataset
+    class_name: HandEventClipDataset
+    dataset_init_args:
+      root_dir: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNew
+      voxel_bins: 5                 # checkpoint stem = in_channels(5) + prev_mask(1) = 6
+      window_ms: 36.0               # checkpoint training window
+      image_height: 240
+      image_width: 320
+      held_out_subject: tuxun       # LOSO held-out subject for val/test
+      require_teacher: True         # set False before running sam2_pseudo_labels.py
+      action_only: True
+      mask_root: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNewTeacherMasks   # complete SAM 2 teacher masks
+      provide_rgb: False
+      num_classes: 1
+      clip_len: 8
+      clip_stride: 4
+      augmentation:
+        enabled: True
+        hflip_prob: 0.5
+        affine_prob: 0.5
+        rotate_deg: 10.0
+        scale_range: [0.9, 1.1]
+        translate_frac: 0.05
+  dataloader:
+    batch_size: 4
+    test_batch_size: 2
+    num_workers: 8
+    persistent_workers: True
+    pin_memory: True
+    multiprocessing_context: fork
+    drop_last: True
+    shuffle_train: True
+    shuffle_val: False
+    shuffle_test: False
+
+MODEL:
+  file_name: event_track_unet
+  class_name: EventTrackUnet
+  model_init_args:
+    in_channels: 5                  # = voxel_bins
+    encoder_channels: [48, 96, 128, 160]
+    num_classes: 1
+    norm: gn
+    gn_groups: 8
+    use_se: True
+    use_context: True
+    context_dilations: [1, 2, 4]
+    use_prev_mask: True
+
+OPTIMIZER:
+  name: AdamW
+  arguments:
+    lr: 3e-4
+    weight_decay: 1e-4
+  gradient_accumulation:
+    enabled: False
+    scheduling: {0: 4, 4: 2, 8: 1}
+  gradient_clip:
+    enabled: True
+    gradient_clip_val: 1.0
+    gradient_clip_algorithm: norm
+  stochastic_weight_averaging:
+    enabled: False
+    swa_lrs: 1e-2
+
+SCHEDULER:
+  learning_rate:
+    enabled: True
+    name: CosineAnnealingLR
+    arguments:
+      T_max: 50
+      eta_min: 1e-6
+  early_stopping:
+    enabled: False
+    monitor: val_loss_epoch
+    mode: min
+    patience: 5
+    min_delta: 1e-5
+
+LOGGER:
+  log_dir_root: lightning_logs
+  experiment_name: hand_tracking_phaseB_eventtrackunet_5bins_36ms
+
+CHECKPOINT:
+  enabled: True
+  every_n_epochs: 1
+  monitor: val_iou_epoch
+  mode: max
+  filename: "best-{epoch:03d}-{val_iou_epoch:.4f}"
+  save_top_k: 1
+  save_last: True

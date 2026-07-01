@@ -1,0 +1,213 @@
+# Per-EVENT Koopman/SSM hand segmentation (EventSSMSegStream) — EDGE-SHARPENING variant
+# of run_ssm_stream_all.yaml. Same model/loss/eval/augmentation; four targeted changes
+# attack the ONE failure of the 0.786 all-subjects run: under fast hand+arm motion the
+# predicted boundary is fuzzy/inaccurate. Root causes (both verified in code):
+#   1. LABEL SMEAR — each event's target was mask[y,x] from a SINGLE center FLIR frame,
+#      but events span the 36 ms window, so a fast-moving edge sweeps across pixels and
+#      window-edge events are mislabeled (teaches a dilated/fuzzy boundary).
+#   2. TIME-AVERAGED /4 LOCALIZER — the context (the boundary placer) was built from
+#      seq.mean(T) on a /4 grid, smearing a moving edge across its whole swept band.
+#
+# The fixes (one knob family each, so the delta is attributable):
+#   A. LABEL DE-SMEAR (the moving-edge label noise) — two TRAIN-ONLY levers that drop the
+#      least-trustworthy events from the loss (they are still predicted at inference):
+#        * boundary_ignore_px: 2   — ignore the ±2 px morphological edge band (the most
+#          motion-smeared / teacher-slop pixels) so the loss stops teaching a dilated edge.
+#        * time_ignore_frac: 0.15  — ignore events in the first/last 15 % of the window,
+#          the most time-displaced from the center teacher frame (worst smear).
+#      (label_mode: nearest_frame is ALSO on, but it is a no-op at window_ms=36 — the
+#      window is sub-frame, so there is no nearer teacher frame to compensate with; it
+#      falls back to the center mask. It activates only with a longer window or denser
+#      teacher masks, at zero cost otherwise. The continuous fix — flow-warping the mask
+#      to each event's sub-frame time — is the next step if these levers plateau.)
+#   B. recency_context + down_factor 4->3 + time_bins 6->10 — the localizer now reads a
+#      LEARNED recency-weighted SSM readout (tracks where the edge is NOW, not the 36 ms
+#      mean) on a finer 3 px grid with finer 3.6 ms time-bins.
+#   C. boundary_loss_weight 2.0 / band 3 — up-weight the (now de-noised) near-boundary
+#      events 2x so the rare, fast-displaced edge events aren't drowned by the interior.
+#
+# NOTE ON THE METRIC: the train-only ignore levers leave val labels clean {0,1} from the
+# center frame, so val_event_f1 stays comparable to the 0.786 baseline. Also judge edge
+# quality from the DYNAMIC val previews (e.g. *_SIDE_DYNAMIC_LIGHT_ladle) and val_iou.
+#
+# Memory: time_bins=10 + down_factor=3 peaks ~29 GB/GPU at batch_size 8 (fits the L40S
+# 48 GB with headroom). down_factor=2 OOMs at B=8 — use /3. Smoke-test first:
+#   EventBasedObjectDetection/bin/python tools/smoke_test_event_ssm_stream.py
+
+TRAINING:
+  deterministic: False
+  use_compile: False
+  inference_mode: False
+  seed: 42
+  max_epochs: 50
+  num_sanity_val_steps: 0
+  task: event_segmentation
+  # LOSS: identical to the winning GJS baseline (GJS + per-sample Lovász). The per-event
+  # boundary up-weighting is applied in model_interface from the model's boundary_loss_*.
+  event_loss_config:
+    bce_weight: 0.0
+    pos_weight: 2.0
+    gjs_weight: 1.0
+    gjs_pi1: 0.5
+    lovasz_weight: 1.0
+  event_eval_config:
+    thr_min: 0.05
+    thr_max: 0.95
+    thr_steps: 19
+    clean_enabled: True
+    clean_open_ksize: 3
+    clean_keep_largest: False
+    clean_min_area: 0
+  val_preview_count: 8
+
+DISTRIBUTED:
+  accelerator: gpu
+  devices: 4
+  num_nodes: 1
+  strategy: auto
+
+DATA:
+  dataset:
+    file_name: hand_event_stream_dataset
+    class_name: HandEventStreamDataset
+    dataset_init_args:
+      root_dir: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNew
+      window_ms: 36.0
+      image_height: 480
+      image_width: 640
+      held_out_subject: tuxun
+      require_teacher: True
+      action_only: False
+      mask_root: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNewTeacherMasks
+      max_events: 150000
+      boundary_ignore_px: 2             # (A) ignore the untrustworthy ±2 px edge band (train only)
+      time_ignore_frac: 0.15            # (A) ignore first/last 15% of the window — worst motion smear (train only)
+      label_mode: nearest_frame         # (A) opportunistic motion-comp; no-op at 36ms (sub-frame window) -> center
+      max_label_frames: 5               # cap on per-window mask loads (closest-to-centre kept)
+      split_mode: all                   # pool all subjects (in-distribution sequence-level holdout)
+      val_frac: 0.1
+      test_frac: 0.1
+      split_seed: 42
+      augmentation:
+        enabled: True
+        hflip_prob: 0.5
+        affine_prob: 0.5
+        rotate_deg: 15.0
+        scale_range: [0.85, 1.20]
+        translate_frac: 0.10
+        event_drop_prob: 0.5
+        event_drop_frac: [0.0, 0.5]
+        upsample_prob: 0.3
+        upsample_range: [1.0, 1.5]
+        vflip_prob: 0.0
+        jitter_px: 1.0
+        area_drop_prob: 0.25
+        area_drop_frac: 0.20
+        time_crop_prob: 0.25
+        time_crop_min: 0.7
+        time_reverse_prob: 0.2
+        polarity_flip_prob: 0.1
+        time_jitter: 0.01
+        noise_frac: 0.05
+        min_events: 64
+      num_classes: 1
+  dataloader:
+    batch_size: 8
+    test_batch_size: 8
+    num_workers: 8
+    persistent_workers: True
+    pin_memory: True
+    multiprocessing_context: fork
+    drop_last: True
+    shuffle_train: True
+    shuffle_val: False
+    shuffle_test: False
+
+MODEL:
+  file_name: event_ssm_seg_stream
+  class_name: EventSSMSegStream
+  model_init_args:
+    in_features: 2
+    time_bins: 10                       # (B) finer 3.6 ms time-bins (was 6 @ 6 ms)
+    down_factor: 3                      # (B) finer 3-px localizer grid (was 4); /2 OOMs at B=8
+    embed_dim: 128
+    d_state: 128
+    ssm_layers: 2
+    context_channels: 128
+    context_depth: 2
+    head_hidden: 128
+    num_classes: 1
+    coord_mode: relative
+    motion_features: True
+    motion_radius: 3
+    motion_dir: False
+    motion_min_count: 6
+    density_features: False
+    dropout: 0.2
+    # --- DMD static veto (the EventSSM identity) -----------------------------------
+    dmd_gate: True
+    dmd_gate_scale: 1.0
+    # --- per-window presence gate (the measured #1 FP-suppressor) ------------------
+    presence_gate: True
+    presence_gate_weight: 0.3
+    presence_gate_scale: 1.0
+    presence_min_fg: 0
+    # --- train-only structure-aware aux head (SA-SSD style; zero inference cost) ----
+    aux_shape_head: True
+    aux_grid: 32
+    aux_shape_weight: 0.2
+    # --- optional background-prototype null loss (off for the clean run) ------------
+    null_loss_weight: 0.0
+    null_margin: 1.0
+    gn_groups: 8
+    # --- (C) recency-weighted temporal readout: track the moving edge's CURRENT
+    #     position instead of the window mean (learned softmax over T, init recent) ---
+    recency_context: True
+    recency_init: 1.0
+    # --- (D) boundary-emphasis loss (read by model_interface): up-weight near-edge
+    #     events 2x within a 3 px band — coherent only on the de-noised labels above ---
+    boundary_loss_weight: 2.0
+    boundary_loss_band: 3
+
+OPTIMIZER:
+  name: AdamW
+  arguments:
+    lr: 3e-4
+    weight_decay: 1e-4
+  gradient_accumulation:
+    enabled: False
+    scheduling: {0: 4, 4: 2, 8: 1}
+  gradient_clip:
+    enabled: True
+    gradient_clip_val: 1.0
+    gradient_clip_algorithm: norm
+  stochastic_weight_averaging:
+    enabled: True
+    swa_lrs: 1e-4
+
+SCHEDULER:
+  learning_rate:
+    enabled: True
+    name: CosineAnnealingLR
+    arguments:
+      T_max: 50
+      eta_min: 1e-6
+  early_stopping:
+    enabled: False
+    monitor: val_loss_epoch
+    mode: min
+    patience: 5
+    min_delta: 1e-5
+
+LOGGER:
+  log_dir_root: lightning_logs
+  experiment_name: run_ssm_stream_all_edge
+
+CHECKPOINT:
+  enabled: True
+  every_n_epochs: 1
+  monitor: val_event_f1_epoch
+  mode: max
+  filename: "best-{epoch:03d}-{val_event_f1_epoch:.4f}"
+  save_top_k: 1
+  save_last: True

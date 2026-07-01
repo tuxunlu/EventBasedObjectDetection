@@ -355,6 +355,18 @@ class EventSparseSegGC(nn.Module):
         aux_shape_head: bool = True,
         aux_grid: int = 32,
         aux_shape_weight: float = 0.2,
+        motion_features: bool = False,
+        motion_radius: int = 3,
+        motion_dir: bool = False,
+        motion_min_count: int = 6,
+        null_loss_weight: float = 0.0,
+        null_margin: float = 1.0,
+        presence_gate: bool = False,
+        presence_gate_weight: float = 0.3,
+        presence_gate_scale: float = 1.0,
+        presence_min_fg: int = 0,
+        context_gather_bilinear: bool = False,
+        context_veto: bool = False,
     ):
         super().__init__()
         require_spconv()  # fail fast with a clear install hint
@@ -375,11 +387,34 @@ class EventSparseSegGC(nn.Module):
         self.aux_shape_head = bool(aux_shape_head)
         self.aux_grid = int(aux_grid)
         self.aux_shape_weight = float(aux_shape_weight)
-        self._aux_logits = None  # set per forward when aux active
+        # Motion descriptor (normal-flow + correlation) channels, and the optional
+        # background-prototype "null state" loss. Both default OFF so every existing
+        # config/subclass is byte-identical; the gc_motion config opts in.
+        self.motion_features = bool(motion_features)
+        self.motion_radius = max(1, int(motion_radius))
+        self.motion_dir = bool(motion_dir)
+        self.motion_min_count = max(3, int(motion_min_count))
+        self.null_loss_weight = float(null_loss_weight)
+        self.null_margin = float(null_margin)
+        # Per-window presence gate (the null state) + per-event shape veto. All default
+        # OFF so every existing config/checkpoint is byte-identical.
+        self.presence_gate = bool(presence_gate)
+        self.presence_gate_weight = float(presence_gate_weight)
+        self.presence_gate_scale = float(presence_gate_scale)
+        self.presence_min_fg = int(presence_min_fg)
+        self.context_gather_bilinear = bool(context_gather_bilinear)
+        self.context_veto = bool(context_veto)
+        self._aux_logits = None        # set per forward when aux active
+        self._event_embedding = None   # set per forward when the null loss is on
+        self._presence_logit = None    # set per forward when the presence gate is on
 
         # Extra per-event channels synthesized in forward (post-augmentation).
         n_geom = {"relative": 2, "absolute": 2, "both": 4, "none": 0}[self.coord_mode]
-        self.n_extra = n_geom + (3 if self.density_features else 0)
+        # Motion: |grad t| (inverse normal-flow speed), planarity, log local count,
+        # (+ 2 unit normal-flow direction channels when motion_dir).
+        n_motion = (3 + (2 if self.motion_dir else 0)) if self.motion_features else 0
+        self.n_motion = n_motion
+        self.n_extra = n_geom + (3 if self.density_features else 0) + n_motion
         feat_dim = self.in_features + self.n_extra
         self._feat_dim = feat_dim
         algo = _resolve_algo(algo)
@@ -437,6 +472,30 @@ class EventSparseSegGC(nn.Module):
             self.aux_shape = nn.Conv2d(self.context_channels, 1, kernel_size=1)
         else:
             self.aux_shape = None
+
+        # Per-window PRESENCE head (the null state): a single image-level "is a moving
+        # hand present in this window?" logit, read from the masked global-average of
+        # the dense context. Its log-sigmoid multiplicatively (in logit space) gates
+        # EVERY per-event logit, so a window with no hand suppresses all events at once
+        # — the direct fix for false positives on no-motion windows. Supervised in
+        # model_interface by whether the window has any foreground event. Active at
+        # train AND inference (the gate uses the PREDICTED presence, never a label).
+        if self.presence_gate:
+            self.presence_head = nn.Sequential(
+                nn.Linear(self.context_channels, self.context_channels),
+                nn.ReLU(inplace=True),
+                nn.Linear(self.context_channels, 1),
+            )
+        else:
+            self.presence_head = None
+
+        # Per-EVENT shape VETO: a log-sigmoid suppression term derived from the event's
+        # own gathered global context, so a location with no hand-shape evidence is
+        # vetoed even within a hand-present window. Suppress-only (<=0), never boosts.
+        if self.context_veto:
+            self.veto_head = nn.Linear(self.context_channels if self.context_gather else c0, 1)
+        else:
+            self.veto_head = None
 
     # ------------------------------------------------------------------ helpers
 
@@ -531,6 +590,105 @@ class EventSparseSegGC(nn.Module):
         std_t = ((bsumt2 / denom) - mean_t * mean_t).clamp(min=0.0).sqrt()
         return torch.stack([torch.log1p(bcnt)[lin], mean_t[lin], std_t[lin]], dim=1)
 
+    def _motion_feats(self, x, y, times, batch_idx, B, H, W):
+        """Per-event MOTION descriptor — the cue the global-shape prior lacks.
+
+        Separates events from a coherently MOVING edge (the hand) from static-scene
+        / sensor-noise events. From the local Surface of Active Events
+        ``t_sae(x, y)`` (most-recent normalized event time per pixel) we fit a plane
+        ``t ≈ a·Δx + b·Δy + c`` in a ``(2r+1)²`` neighborhood by occupancy-weighted
+        least squares — the event-flow primitive of Benosman et al. (event visual
+        flow, IEEE TNNLS 2014) — computed for the WHOLE frame at once via fixed-kernel
+        2-D convolutions, then gathered per event. Channels:
+
+          * ``|∇t|``      — gradient magnitude of the time surface = inverse
+                            normal-flow speed; ≈0 on a flat/static/empty surface,
+                            large for a fast moving edge.
+          * ``planarity`` — ``1/(1+residual)``: ≈1 when the local surface is a clean
+                            moving-edge ramp, →0 for an incoherent (noise/texture)
+                            neighborhood. The "is this real motion" confidence.
+          * ``log1p(n)``  — local spatiotemporal event count (BAF correlation gate;
+                            an isolated noise event scores ≈0).
+          * optional: the unit normal-flow direction ``(a, b)/|∇t|`` (``motion_dir``).
+
+        The grid is fixed-size, so cost is constant in the event count. Computed under
+        ``no_grad`` — it is a deterministic hand-crafted INPUT feature, not a learned
+        path, so there is nothing to backprop into (coords/times are not parameters).
+        """
+        if not self.motion_features:
+            return None
+        with torch.no_grad():
+            dev = times.device
+            ft = torch.float32                         # condition the plane solve in fp32
+            b = batch_idx.long(); xi = x.long(); yi = y.long()
+            r = self.motion_radius
+            k = 2 * r + 1
+            n = B * H * W
+            lin = (b * H + yi) * W + xi
+            t = times.to(ft)
+            # Surface of Active Events: most-recent time per pixel + integer count.
+            sae = torch.zeros(n, device=dev, dtype=ft).scatter_reduce_(
+                0, lin, t, reduce="amax", include_self=True)
+            cnt = torch.zeros(n, device=dev, dtype=ft).index_add_(
+                0, lin, torch.ones_like(t))
+            sae = sae.view(B, 1, H, W)
+            m = (cnt.view(B, 1, H, W) > 0).to(ft)      # occupancy weight in {0,1}
+            mt = sae * m                               # m·t  (sae is 0 where empty)
+            mt2 = mt * sae                             # m·t²
+            # Fixed neighborhood-offset kernels (cross-correlation; offset = u-r, v-r).
+            off = (torch.arange(k, device=dev, dtype=ft) - r)
+            dxk = off.view(1, 1, 1, k).expand(1, 1, k, k).contiguous()   # Δx (column)
+            dyk = off.view(1, 1, k, 1).expand(1, 1, k, k).contiguous()   # Δy (row)
+            onek = torch.ones(1, 1, k, k, device=dev, dtype=ft)
+            dx2k = dxk * dxk; dy2k = dyk * dyk; dxyk = dxk * dyk
+
+            def cv(src, ker):
+                return F.conv2d(src, ker, padding=r).view(-1)[lin]       # gather per event
+
+            # Occupancy-weighted neighborhood sums, gathered at each event's pixel.
+            S1 = cv(m, onek); Sx = cv(m, dxk); Sy = cv(m, dyk)
+            Sxx = cv(m, dx2k); Syy = cv(m, dy2k); Sxy = cv(m, dxyk)
+            St = cv(mt, onek); Stx = cv(mt, dxk); Sty = cv(mt, dyk); Stt = cv(mt2, onek)
+            cnt_e = cv(m * cnt.view(B, 1, H, W), onek)                   # Σ neighborhood count
+
+            # Solve the 3×3 weighted normal equations per event (ridge for stability).
+            lam = 1e-3
+            N = t.shape[0]
+            M3 = torch.zeros(N, 3, 3, device=dev, dtype=ft)
+            M3[:, 0, 0] = Sxx + lam; M3[:, 0, 1] = Sxy; M3[:, 0, 2] = Sx
+            M3[:, 1, 0] = Sxy; M3[:, 1, 1] = Syy + lam; M3[:, 1, 2] = Sy
+            M3[:, 2, 0] = Sx;  M3[:, 2, 1] = Sy;  M3[:, 2, 2] = S1 + lam
+            rhs = torch.stack([Stx, Sty, St], dim=1).unsqueeze(-1)
+            abc = torch.linalg.solve(M3, rhs).squeeze(-1)               # (N, 3)
+            a, bb, cc = abc[:, 0], abc[:, 1], abc[:, 2]
+            grad_mag = torch.sqrt(a * a + bb * bb + 1e-12)
+            resid = (Stt - a * Stx - bb * Sty - cc * St).clamp_min(0.0)
+            # Planarity = R² of the plane fit = fraction of local time-variance the
+            # plane explains. A coherent moving-edge ramp -> R²≈1; a temporally
+            # incoherent flicker -> the plane explains ~nothing -> R²≈0. Scale-free,
+            # so it separates motion from look-alike dense background far better than
+            # 1/(1+resid). A near-constant surface (total_var≈0) is degenerately
+            # planar -> 1 (grad_mag≈0 there lets the head tell "flat" from "ramp").
+            mean_t = St / S1.clamp_min(1.0)
+            total_var = (Stt - St * mean_t).clamp_min(0.0)        # Σ m (t-mean_t)²
+            r2 = 1.0 - resid / total_var.clamp_min(1e-6)
+            planarity = torch.where(total_var > 1e-6, r2.clamp(0.0, 1.0),
+                                    torch.ones_like(r2))
+            # Gate: an under-populated neighborhood cannot constrain a 3-DOF plane, so
+            # the fit is degenerate (residual ≈0 -> false-high planarity, noise-driven
+            # gradient). Zero the motion evidence there. This doubles as a BAF
+            # correlation gate: an isolated event (sparse neighborhood) reads as NO
+            # motion — exactly the static-scene noise we want to reject.
+            valid = (S1 >= float(self.motion_min_count)).to(ft)
+            grad_mag = grad_mag * valid
+            planarity = planarity * valid
+            chans = [grad_mag, planarity, torch.log1p(cnt_e)]
+            if self.motion_dir:
+                inv = 1.0 / grad_mag.clamp_min(1e-6)
+                chans += [a * inv * valid, bb * inv * valid]
+            out = torch.stack(chans, dim=1)
+        return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+
     def _build_dense(self, sp, c3, B):
         """Time-collapse the bottleneck sparse tensor into a dense ``(B, c3, Hd, Wd)``
         map (scatter-mean over ``t`` per ``(b, y, x)`` column) plus a ``(B, 1, Hd, Wd)``
@@ -551,8 +709,41 @@ class EventSparseSegGC(nn.Module):
         occ = (cnt > 0).to(feats.dtype).view(B, Hd, Wd, 1).permute(0, 3, 1, 2).contiguous()
         return dense, occ, Hd, Wd, col
 
+    @staticmethod
+    def _bilinear_gather(ctx_flat, x, y, batch_idx, Hd, Wd, H, W):
+        """Bilinearly sample the dense ``(B*Hd*Wd, C)`` context at each event's
+        continuous full-res ``(x, y)``.
+
+        The nearest-``/8``-cell gather makes every ``8×8``-px block share one context
+        vector — the source of the rectangular artifacts and of a veto that cannot act
+        below cell resolution. Bilinear interpolation over the 4 surrounding cells
+        gives a smoothly-varying, per-event-precise context (PointPainting/PVCNN-style
+        continuous voxel→point feature propagation). Empty neighbor cells still carry
+        context the dense convs propagated in, so the interpolation stays valid.
+        """
+        b = batch_idx.long()
+        # Map full-res pixel centre -> dense-grid continuous coordinate.
+        fy = (y.float() + 0.5) * Hd / H - 0.5
+        fx = (x.float() + 0.5) * Wd / W - 0.5
+        y0 = torch.floor(fy); x0 = torch.floor(fx)
+        wy = (fy - y0); wx = (fx - x0)
+        y0 = y0.long(); x0 = x0.long(); y1 = y0 + 1; x1 = x0 + 1
+        y0c = y0.clamp(0, Hd - 1); y1c = y1.clamp(0, Hd - 1)
+        x0c = x0.clamp(0, Wd - 1); x1c = x1.clamp(0, Wd - 1)
+
+        def at(yi, xi):
+            return ctx_flat[(b * Hd + yi) * Wd + xi]
+        c00 = at(y0c, x0c); c01 = at(y0c, x1c)
+        c10 = at(y1c, x0c); c11 = at(y1c, x1c)
+        wy = wy.unsqueeze(1); wx = wx.unsqueeze(1)
+        top = c00 * (1 - wx) + c01 * wx
+        bot = c10 * (1 - wx) + c11 * wx
+        return top * (1 - wy) + bot * wy
+
     def forward(self, batch) -> torch.Tensor:
         self._aux_logits = None
+        self._event_embedding = None
+        self._presence_logit = None
         feats = batch.feats
         N = feats.shape[0]
         if N == 0:
@@ -574,6 +765,9 @@ class EventSparseSegGC(nn.Module):
         dfeat = self._density_feats(x, y, times, t_bin, batch.batch_idx, B, T, H, W)
         if dfeat is not None:
             parts.append(dfeat.to(feats.dtype))
+        mfeat = self._motion_feats(x, y, times, batch.batch_idx, B, H, W)
+        if mfeat is not None:
+            parts.append(mfeat.to(feats.dtype))
         feats = torch.cat(parts, dim=1) if len(parts) > 1 else feats
 
         vox_coords, vox_batch, vox_feats, inverse = self._voxelize(
@@ -597,6 +791,14 @@ class EventSparseSegGC(nn.Module):
         vox_ctx = ctx_flat[col]                              # (M3, c_ctx)
         e3 = e3.replace_feature(
             e3.features + self.ctx_drop_path(self.ctx_to_c3(vox_ctx)))
+
+        # Per-window presence logit from the masked global-average of the context map
+        # (true image-level descriptor). Stashed for the auxiliary BCE in
+        # model_interface and used below to gate every event's logit.
+        if self.presence_head is not None:
+            denom = occ.flatten(2).sum(dim=2).clamp(min=1.0)             # (B, 1)
+            gdesc = (ctx_map * occ).flatten(2).sum(dim=2) / denom        # (B, c_ctx)
+            self._presence_logit = self.presence_head(gdesc).squeeze(-1)  # (B,)
 
         # Aux coarse occupancy map (train-only supervision in model_interface).
         if self.aux_shape is not None and self.training:
@@ -625,16 +827,44 @@ class EventSparseSegGC(nn.Module):
         # Per-event head: decoder context ⊕ event features (⊕ direct global context).
         ev_ctx = self.feat_drop(vox_out[inverse])            # (N, c0)
         head_parts = [ev_ctx, feats]
+        gathered_ctx = None
         if self.context_gather:
-            # Gather the dense context at each event's /8 cell directly (a global skip
-            # straight to the head, routed by the event's own coords -> preserves the
-            # logits[i] <-> labels[i] contract). Empty cells still carry context that
-            # the dense convs propagated from neighbors — the whole point.
-            egy = (y.long() * Hd // H).clamp(0, Hd - 1)
-            egx = (x.long() * Wd // W).clamp(0, Wd - 1)
-            ecol = (batch.batch_idx.long() * Hd + egy) * Wd + egx
-            head_parts.append(ctx_flat[ecol])                # (N, c_ctx)
-        logits = self.head(torch.cat(head_parts, dim=1))
+            # Gather the dense context at each event directly (a global skip straight to
+            # the head, routed by the event's own coords -> preserves the logits[i] <->
+            # labels[i] contract). Bilinear (default off) removes the 8×8-block sharing
+            # that nearest-cell gather imposes. Empty cells still carry context the dense
+            # convs propagated from neighbors — the whole point.
+            if self.context_gather_bilinear:
+                gathered_ctx = self._bilinear_gather(
+                    ctx_flat, x, y, batch.batch_idx, Hd, Wd, H, W)
+            else:
+                egy = (y.long() * Hd // H).clamp(0, Hd - 1)
+                egx = (x.long() * Wd // W).clamp(0, Wd - 1)
+                ecol = (batch.batch_idx.long() * Hd + egy) * Wd + egx
+                gathered_ctx = ctx_flat[ecol]
+            head_parts.append(gathered_ctx)                  # (N, c_ctx)
+        # Run the head in two pieces so the penultimate EMBEDDING is exposed for the
+        # background-prototype null loss (``self.head`` itself is unchanged, so the
+        # gate/ml subclasses that call it as a whole still work).
+        head_in = torch.cat(head_parts, dim=1)
+        emb = self.head[:-1](head_in)
+        logits = self.head[-1](emb)
+        if self.training and self.null_loss_weight > 0.0:
+            self._event_embedding = emb
+
+        # Per-event shape VETO: suppress-only (log-sigmoid <= 0) gate from the event's
+        # gathered context (falls back to decoder context if context_gather is off).
+        if self.veto_head is not None:
+            vsrc = gathered_ctx if gathered_ctx is not None else ev_ctx
+            logits = logits + F.logsigmoid(self.veto_head(vsrc))
+
+        # Per-window PRESENCE gate (null state): add the window's log-sigmoid presence
+        # to every event logit. presence→1 ⇒ +0 (no change); presence→0 ⇒ large
+        # negative ⇒ all events suppressed. Applied at train AND eval (uses the
+        # predicted presence, no label) so the operating point matches.
+        if self._presence_logit is not None:
+            gate = self.presence_gate_scale * F.logsigmoid(self._presence_logit)
+            logits = logits + gate[batch.batch_idx.long()].view(logits.shape)
 
         if self.num_classes == 1:
             return logits.squeeze(-1)

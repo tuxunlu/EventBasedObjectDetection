@@ -1,8 +1,20 @@
-# Frame-based I-JEPA: HandEventDataset voxel -> EventJEPAFrame -> (N,1,H,W) mask.
-# Dense analogue of the per-event JEPA: an EventUnet (BCE+Dice on cached SAM2 masks)
-# with a TRAIN-ONLY I-JEPA pretext on the encoder bottleneck feature map. task=
-# segmentation routes to ModelInterface._segmentation_step (3-tuple voxel/mask batch),
-# which reads model._jepa_loss x jepa_weight (the dense hook).
+# Frame-based I-JEPA on N-HOT3D — NHOT3DFrameDataset voxel -> EventJEPAFrame -> (N,1,H,W).
+#
+# Dense (voxel) analogue of the per-event N-HOT3D runs. An EventUnet (BCE+Dice on the
+# dataset's GROUND-TRUTH MANO hand masks — no SAM 2 teacher) with a TRAIN-ONLY I-JEPA
+# pretext on the encoder bottleneck feature map. task=segmentation routes to
+# ModelInterface._segmentation_step (3-tuple voxel/mask batch), which reads
+# model._jepa_loss x jepa_weight (the dense hook); at inference the predictor + EMA
+# target are dropped, so the inference path is exactly an EventUnet.
+#
+# Dataloader = data/nhot3d_frame_dataset.py::NHOT3DFrameDataset — the dense voxel-frame
+# sibling of NHOT3DEventDataset (same on-disk enumeration / split / GT-mask union; only
+# the per-sample representation changes from sparse events to a Zhu-et-al voxel grid).
+# N-HOT3D's many subjects should relax the LOSO diversity ceiling (loso-ceiling memory).
+#
+# Resolution: 256x256 (down from the native 512x512) keeps the dense voxel x batch
+# memory in the same ballpark as the 240x320 NatureRobotics frame-JEPA run; events are
+# rescaled from the native 346x260 sensor to 256x256 inside the dataset.
 
 TRAINING:
   deterministic: False
@@ -10,6 +22,7 @@ TRAINING:
   inference_mode: False
   seed: 42
   max_epochs: 50
+  num_sanity_val_steps: 0
   task: segmentation
   seg_pos_weight: null            # raise to ~5-20 if val_iou stalls (all-zero collapse)
   val_preview_count: 4
@@ -22,27 +35,22 @@ DISTRIBUTED:
 
 DATA:
   dataset:
-    file_name: hand_event_dataset
-    class_name: HandEventDataset
+    file_name: nhot3d_frame_dataset
+    class_name: NHOT3DFrameDataset
     dataset_init_args:
-      root_dir: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNew
+      # root = the Aria/ dir holding train/ valid/ test/. ``purpose`` (injected by
+      # DataInterface) picks the split — splits are subject-disjoint dirs on disk.
+      root_dir: /fs/nexus-projects/DVS_Actions/N-HOT3D/Aria
       voxel_bins: 20                # MUST equal MODEL.in_channels
-      window_ms: 144.0
-      image_height: 240
-      image_width: 320
-      held_out_subject: tuxun
-      require_teacher: True
-      action_only: True
-      mask_root: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNewTeacherMasks
-      provide_rgb: False
+      image_height: 256
+      image_width: 256
+      event_height: 260             # native event sensor; rescaled to image_* per axis
+      event_width: 346
+      frames_per_sample: 1
+      max_events: 150000
+      require_mask: True
       num_classes: 1
-      # split_mode: loso = leave-one-subject-out (cross-subject generalization).
-      # Switch to 'all' to pool all 4 subjects with an in-distribution sequence-level
-      # holdout (lifts the LOSO diversity ceiling — see loso-ceiling memory).
-      split_mode: loso
-      val_frac: 0.1               # used only when split_mode='all'
-      test_frac: 0.1
-      split_seed: 42
+      # DENSE geometric augmentation (voxel bilinear + mask nearest); train-only.
       augmentation:
         enabled: True
         hflip_prob: 0.5
@@ -77,7 +85,7 @@ MODEL:
     # ---- I-JEPA pretext (train-only; dropped at inference) ----
     jepa_weight: 1.0              # weight on the latent-prediction loss (0 disables)
     jepa_patch: 1                 # avg-pool factor over bottleneck cells -> token grid
-                                  # (240x320 /8 = 30x40 = 1200 tokens at patch 1)
+                                  # (256x256 /8 = 32x32 = 1024 tokens at patch 1)
     jepa_mask_ratio: 0.6          # fraction of patch tokens masked as targets
     jepa_pred_dim: 160            # predictor token dim (= encoder_channels[-1])
     jepa_pred_depth: 2
@@ -119,7 +127,7 @@ SCHEDULER:
 
 LOGGER:
   log_dir_root: lightning_logs
-  experiment_name: hand_seg_frame_jepa_loso
+  experiment_name: hand_event_seg_nhot3d_jepa_frame
 
 CHECKPOINT:
   enabled: True

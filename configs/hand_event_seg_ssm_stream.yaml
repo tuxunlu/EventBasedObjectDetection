@@ -1,0 +1,189 @@
+# Per-EVENT Koopman/SSM hand segmentation — EventSSMSegStream (event stream in,
+# FILTERED event stream out; one logit per event, no dense-mask rasterization).
+#
+# What this is
+# ------------
+# The per-event evolution of the dense voxel->mask EventSSMSeg (configs/
+# hand_event_seg_ssm.yaml, ~96k params). It keeps that model's identity — a
+# structured-Koopman complex-diagonal SSM over T time-bin snapshots + a DMD-style
+# static-vs-dynamic veto — but (1) emits ONE LOGIT PER EVENT (so it cannot produce the
+# blocky "frame artifact" a coarse voxel->mask decoder upsamples into), and (2) grows
+# ~10x to ~975k params, and (3) adds the measured #1 FP-suppressor: a dense global-
+# context bottleneck + per-window presence gate (as in EventSparseSegGC).
+#
+# Per-event sharpness comes from each event's own continuous features (centroid-relative
+# coords, normal-flow motion, sub-cell offset, in-bin time) + a bilinearly-interpolated
+# context; FP robustness comes from the coarse global context. The SSM is purely
+# temporal (Koopman per cell), the context net purely spatial — a clean factorization.
+#
+# CLEAN ABLATION: loss / eval / augmentation / window / time_bins all MATCH the winning
+# GJS baseline and the EventSparseSegGC run (val F1 0.6895), so any delta is attributable
+# to this architecture. Pure torch (no spconv). Smoke-test first:
+#   EventBasedObjectDetection/bin/python tools/smoke_test_event_ssm_stream.py
+
+TRAINING:
+  deterministic: False
+  use_compile: False
+  inference_mode: False
+  seed: 42
+  max_epochs: 50
+  num_sanity_val_steps: 0
+  task: event_segmentation
+  # LOSS: identical to the 0.654 GJS baseline / the gc run (GJS + per-sample Lovász).
+  event_loss_config:
+    bce_weight: 0.0
+    pos_weight: 2.0
+    gjs_weight: 1.0
+    gjs_pi1: 0.5
+    lovasz_weight: 1.0
+  event_eval_config:
+    thr_min: 0.05
+    thr_max: 0.95
+    thr_steps: 19
+    clean_enabled: True
+    clean_open_ksize: 3
+    clean_keep_largest: False
+    clean_min_area: 0
+  val_preview_count: 8
+
+DISTRIBUTED:
+  accelerator: gpu
+  devices: 4
+  num_nodes: 1
+  strategy: auto
+
+DATA:
+  dataset:
+    file_name: hand_event_stream_dataset
+    class_name: HandEventStreamDataset
+    dataset_init_args:
+      root_dir: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNew
+      window_ms: 36.0
+      image_height: 480
+      image_width: 640
+      held_out_subject: tuxun           # LOSO held-out subject for val/test
+      require_teacher: True
+      action_only: False
+      mask_root: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNewTeacherMasks
+      max_events: 150000
+      boundary_ignore_px: 0
+      time_ignore_frac: 0.0
+      split_mode: loso                  # 'all' to pool all subjects (in-distribution holdout)
+      val_frac: 0.1
+      test_frac: 0.1
+      split_seed: 42
+      augmentation:
+        enabled: True
+        hflip_prob: 0.5
+        affine_prob: 0.5
+        rotate_deg: 15.0
+        scale_range: [0.85, 1.20]
+        translate_frac: 0.10
+        event_drop_prob: 0.5
+        event_drop_frac: [0.0, 0.5]
+        upsample_prob: 0.3
+        upsample_range: [1.0, 1.5]
+        vflip_prob: 0.0
+        jitter_px: 1.0
+        area_drop_prob: 0.25
+        area_drop_frac: 0.20
+        time_crop_prob: 0.25
+        time_crop_min: 0.7
+        time_reverse_prob: 0.2
+        polarity_flip_prob: 0.1
+        time_jitter: 0.01
+        noise_frac: 0.05
+        min_events: 64
+      num_classes: 1
+  dataloader:
+    batch_size: 8
+    test_batch_size: 8
+    num_workers: 8
+    persistent_workers: True
+    pin_memory: True
+    multiprocessing_context: fork
+    drop_last: True
+    shuffle_train: True
+    shuffle_val: False
+    shuffle_test: False
+
+MODEL:
+  file_name: event_ssm_seg_stream
+  class_name: EventSSMSegStream
+  model_init_args:
+    in_features: 2                      # (polarity, t_norm); geom/motion/sub-cell synthesized in-model
+    time_bins: 6                        # T = Koopman/SSM time-bin snapshots
+    down_factor: 4                      # coarse grid /4 (4x4-px cells); 8 = cheaper, coarser
+    embed_dim: 128                      # per-event embedding = SSM model dim
+    d_state: 128                        # complex-diagonal SSM modes (Koopman eigenvalues)
+    ssm_layers: 2                       # stacked residual SSM blocks over time
+    context_channels: 128              # dense global-context width
+    context_depth: 2                    # dilated convs in the context net (spatial field)
+    head_hidden: 128
+    num_classes: 1
+    coord_mode: relative                # centroid-relative geometry (no subject-location leak)
+    motion_features: True               # per-event normal-flow plane-fit cue
+    motion_radius: 3
+    motion_dir: False
+    motion_min_count: 6
+    density_features: False
+    dropout: 0.2
+    # --- DMD static veto (the EventSSM identity) -----------------------------------
+    dmd_gate: True
+    dmd_gate_scale: 1.0
+    # --- per-window presence gate (the measured #1 FP-suppressor) ------------------
+    presence_gate: True
+    presence_gate_weight: 0.3
+    presence_gate_scale: 1.0
+    presence_min_fg: 0
+    # --- train-only structure-aware aux head (SA-SSD style; zero inference cost) ----
+    aux_shape_head: True
+    aux_grid: 32
+    aux_shape_weight: 0.2
+    # --- optional background-prototype null loss (off for the clean run) ------------
+    null_loss_weight: 0.0
+    null_margin: 1.0
+    gn_groups: 8
+
+OPTIMIZER:
+  name: AdamW
+  arguments:
+    lr: 3e-4
+    weight_decay: 1e-4
+  gradient_accumulation:
+    enabled: False
+    scheduling: {0: 4, 4: 2, 8: 1}
+  gradient_clip:
+    enabled: True
+    gradient_clip_val: 1.0
+    gradient_clip_algorithm: norm
+  stochastic_weight_averaging:
+    enabled: True
+    swa_lrs: 1e-4
+
+SCHEDULER:
+  learning_rate:
+    enabled: True
+    name: CosineAnnealingLR
+    arguments:
+      T_max: 50
+      eta_min: 1e-6
+  early_stopping:
+    enabled: False
+    monitor: val_loss_epoch
+    mode: min
+    patience: 5
+    min_delta: 1e-5
+
+LOGGER:
+  log_dir_root: lightning_logs
+  experiment_name: hand_event_seg_ssm_stream
+
+CHECKPOINT:
+  enabled: True
+  every_n_epochs: 1
+  monitor: val_event_f1_epoch
+  mode: max
+  filename: "best-{epoch:03d}-{val_event_f1_epoch:.4f}"
+  save_top_k: 1
+  save_last: True

@@ -1,0 +1,135 @@
+# Temporal tracking on N-HOT3D — NHOT3DClipDataset clip -> EventTrackUnet -> (N,T,1,H,W).
+#
+# Dense (voxel-clip) recurrent model: an EventUnet with a ConvGRU bottleneck memory +
+# previous-mask feedback carried across the clip's T frames, so the mask stops
+# flickering between independent windows (the event-only analogue of SAM 2's memory).
+# task=tracking routes to ModelInterface._tracking_step ((voxel(N,T,C,H,W),
+# mask(N,T,H,W)) batch): per-frame BCE+Dice on the dataset's GROUND-TRUTH MANO hand
+# masks (no SAM 2 teacher) + a static-region temporal-consistency penalty.
+#
+# Dataloader = data/nhot3d_frame_dataset.py::NHOT3DClipDataset — re-groups the per-frame
+# N-HOT3D index into ordered clip_len-frame clips within a sequence (clip-consistent
+# augmentation; clips never cross a sequence boundary). Same on-disk enumeration / split
+# / GT-mask union as NHOT3DEventDataset; representation = a Zhu-et-al voxel grid per
+# frame. N-HOT3D's many subjects should relax the LOSO ceiling (loso-ceiling memory).
+#
+# Resolution: 256x256 (down from native 512x512) keeps clip x BPTT memory tractable;
+# events are rescaled from the native 346x260 sensor inside the dataset.
+
+TRAINING:
+  deterministic: False
+  use_compile: False
+  inference_mode: False
+  seed: 42
+  max_epochs: 50
+  num_sanity_val_steps: 0
+  task: tracking
+  seg_pos_weight: null
+  temporal_consistency_weight: 0.5    # static-region anti-flicker penalty (0 disables)
+  val_preview_count: 4
+
+DISTRIBUTED:
+  accelerator: gpu
+  devices: 4
+  num_nodes: 1
+  strategy: auto
+
+DATA:
+  dataset:
+    file_name: nhot3d_frame_dataset
+    class_name: NHOT3DClipDataset
+    dataset_init_args:
+      # root = the Aria/ dir holding train/ valid/ test/. ``purpose`` (injected by
+      # DataInterface) picks the split — splits are subject-disjoint dirs on disk.
+      root_dir: /fs/nexus-projects/DVS_Actions/N-HOT3D/Aria
+      voxel_bins: 5                 # time bins; two_channel doubles the voxel channels
+      # Separate ON/OFF count channels per bin (voxel = 2*voxel_bins channels).
+      # The legacy "signed" mode sums ±1 into one channel, so opposite polarities
+      # at the same pixel/bin cancel and the ON-leading/OFF-trailing edge
+      # structure (the motion-direction cue) is lost to the model.
+      polarity_mode: two_channel
+      image_height: 256
+      image_width: 256
+      event_height: 260             # native event sensor; rescaled to image_* per axis
+      event_width: 346
+      max_events: 150000
+      require_mask: True
+      num_classes: 1
+      clip_len: 8                   # consecutive kept frames per clip (BPTT window)
+      clip_stride: 4                # 4 = 50%-overlapping clips
+      # DENSE geometric augmentation (clip-consistent: same transform every frame).
+      augmentation:
+        enabled: True
+        hflip_prob: 0.5
+        affine_prob: 0.5
+        rotate_deg: 10.0
+        scale_range: [0.9, 1.1]
+        translate_frac: 0.05
+  dataloader:
+    batch_size: 2
+    test_batch_size: 2
+    num_workers: 8
+    persistent_workers: True
+    pin_memory: True
+    multiprocessing_context: fork
+    drop_last: True
+    shuffle_train: True
+    shuffle_val: False
+    shuffle_test: False
+
+MODEL:
+  file_name: event_track_unet
+  class_name: EventTrackUnet
+  model_init_args:
+    in_channels: 10                 # = 2 * voxel_bins (polarity_mode: two_channel); stem = 10 + prev_mask(1) = 11
+    encoder_channels: [48, 96, 128, 160]
+    num_classes: 1
+    norm: gn                        # GroupNorm only (BatchNorm leaks the LOSO subject)
+    gn_groups: 8
+    use_se: True
+    use_context: True
+    context_dilations: [1, 2, 4]
+    use_prev_mask: True             # SAM2-style "condition on the last mask" feedback
+
+OPTIMIZER:
+  name: AdamW
+  arguments:
+    lr: 3e-4
+    weight_decay: 1e-4
+  gradient_accumulation:
+    enabled: False
+    scheduling: {0: 4, 4: 2, 8: 1}
+  gradient_clip:
+    enabled: True
+    gradient_clip_val: 1.0
+    gradient_clip_algorithm: norm
+  stochastic_weight_averaging:
+    enabled: False
+    swa_lrs: 1e-2
+
+SCHEDULER:
+  learning_rate:
+    enabled: True
+    name: CosineAnnealingLR
+    arguments:
+      T_max: 50
+      eta_min: 1e-6
+  early_stopping:
+    enabled: False
+    monitor: val_loss_epoch
+    mode: min
+    patience: 5
+    min_delta: 1e-5
+
+LOGGER:
+  log_dir_root: lightning_logs
+  experiment_name: hand_event_seg_nhot3d_track_unet
+
+CHECKPOINT:
+  enabled: True
+  every_n_epochs: 1
+  monitor: val_iou_epoch
+  mode: max
+  filename: "best-{epoch:03d}-{val_iou_epoch:.4f}"
+  save_top_k: 1
+  save_last: True

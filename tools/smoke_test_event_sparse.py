@@ -24,9 +24,12 @@ import time
 import torch
 
 from data.sparse_event_collate import collate_sparse_events
-from loss.event_distillation import EventDistillationLoss
+from loss.event_distillation import EventDistillationLoss, background_prototype_loss
 from model.event_sparse_seg import EventSparseSeg
 from model.event_sparse_seg_gc import EventSparseSegGC
+from model.event_sparse_seg_gc_gate import EventSparseSegGCGate
+from model.event_sparse_seg_gc_ml import EventSparseSegGCML
+from model.event_jepa_seg import EventJEPASeg
 
 
 def _synth_sample(n_events: int, H: int, W: int, gen: torch.Generator):
@@ -58,14 +61,22 @@ def main() -> int:
     ap.add_argument("--in_features", type=int, default=2)
     ap.add_argument("--time_bins", type=int, default=6)
     ap.add_argument("--max_params", type=int, default=1_200_000)
-    ap.add_argument("--model", choices=("ess", "gc"), default="ess",
+    ap.add_argument("--model", choices=("ess", "gc", "gc_gate", "gc_ml", "jepa"), default="ess",
                     help="ess = EventSparseSeg (submanifold U-Net); "
-                         "gc = EventSparseSegGC (+ dense global-context bottleneck).")
+                         "gc = EventSparseSegGC (+ dense global-context bottleneck); "
+                         "gc_gate = +multiplicative occupancy/present veto gate (A+B); "
+                         "gc_ml = +dense context at the /2 and /4 encoder levels; "
+                         "jepa = EventJEPASeg (from-scratch motion-token + JEPA core, no spconv).")
     ap.add_argument("--coord_mode", default="relative",
                     help="EventSparseSegGC geometry mode: relative|absolute|both|none.")
     ap.add_argument("--algo", default="implicit_gemm",
                     help="spconv conv algo: 'native' avoids the implicit-GEMM SIGFPE "
                          "under a CUDA runtime newer than the spconv wheel.")
+    ap.add_argument("--motion", action="store_true",
+                    help="(model=gc) enable motion_features + the background-prototype "
+                         "null loss (exercises _motion_feats and _event_embedding).")
+    ap.add_argument("--motion_dir", action="store_true",
+                    help="(model=gc --motion) add the 2 normal-flow direction channels.")
     ap.add_argument("--geom", action="store_true",
                     help="enable EventSparseSeg.geom_features (+normalized x,y).")
     ap.add_argument("--density", action="store_true",
@@ -91,14 +102,26 @@ def main() -> int:
     print(f"[data ] batch_size={batch.batch_size} total_events={n_ev} "
           f"feat_dim={batch.feats.shape[1]}")
 
-    if args.model == "gc":
-        model = EventSparseSegGC(in_features=args.in_features, time_bins=args.time_bins,
-                                 num_classes=1, algo=args.algo,
-                                 coord_mode=args.coord_mode,
-                                 density_features=args.density).to(device)
-        print(f"[model] EventSparseSegGC coord_mode={args.coord_mode} "
+    if args.model in ("gc", "gc_gate", "gc_ml"):
+        gc_cls = {"gc": EventSparseSegGC, "gc_gate": EventSparseSegGCGate,
+                  "gc_ml": EventSparseSegGCML}[args.model]
+        gc_kwargs = dict(in_features=args.in_features, time_bins=args.time_bins,
+                         num_classes=1, algo=args.algo, coord_mode=args.coord_mode,
+                         density_features=args.density)
+        if args.model == "gc" and args.motion:
+            gc_kwargs.update(motion_features=True, motion_dir=args.motion_dir,
+                             null_loss_weight=0.5, null_margin=1.0)
+        model = gc_cls(**gc_kwargs).to(device)
+        print(f"[model] {gc_cls.__name__} coord_mode={args.coord_mode} "
               f"density_features={args.density} context_channels={model.context_channels} "
-              f"aux_shape_head={model.aux_shape_head} n_extra={model.n_extra}")
+              f"aux_shape_head={model.aux_shape_head} n_extra={model.n_extra} "
+              f"motion_features={getattr(model, 'motion_features', False)}")
+    elif args.model == "jepa":
+        model = EventJEPASeg(in_features=args.in_features, num_classes=1,
+                             jepa_weight=1.0).to(device)
+        Hs, Ws, Ntok = model._grid(args.height, args.width)
+        print(f"[model] EventJEPASeg patch_size={model.patch_size} dim={model.dim} "
+              f"tokens={Ntok} ({Hs}x{Ws}) jepa_weight={model.jepa_weight}")
     else:
         model = EventSparseSeg(in_features=args.in_features, time_bins=args.time_bins,
                                num_classes=1, algo=args.algo,
@@ -132,6 +155,21 @@ def main() -> int:
     aux_logits = getattr(model, "_aux_logits", None)
     if aux_logits is not None:
         total = total + 0.2 * aux_logits.float().mean()
+    # Background-prototype null loss (exercises the exposed per-event embedding).
+    emb = getattr(model, "_event_embedding", None)
+    if emb is not None:
+        nullv = background_prototype_loss(emb, batch.labels, batch.batch_idx, margin=1.0)
+        total = total + 0.5 * nullv
+        print(f"[null ] embedding={tuple(emb.shape)} null_loss={nullv.item():.4f}")
+    elif args.model == "gc" and args.motion:
+        raise AssertionError("--motion set but model._event_embedding was not exposed")
+    # JEPA latent-prediction pretext loss (EventJEPASeg, train-only).
+    jl = getattr(model, "_jepa_loss", None)
+    if jl is not None:
+        total = total + float(getattr(model, "jepa_weight", 1.0)) * jl
+        print(f"[jepa ] jepa_loss={jl.item():.4f}")
+    elif args.model == "jepa":
+        raise AssertionError("--model jepa but model._jepa_loss was not exposed")
     total.backward()
     n_grad = sum(int(p.grad is not None) for p in model.parameters() if p.requires_grad)
     n_train = sum(1 for p in model.parameters() if p.requires_grad)

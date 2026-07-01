@@ -1,0 +1,187 @@
+# Event-native per-event segmentation — GLOBAL-CONTEXT + PRESENCE GATE (null state).
+#
+# Goal of this run
+# ----------------
+# Remove the FALSE POSITIVES the original gc model (run 20260623-01-58-49, val F1
+# 0.6895) fires on NO-MOTION windows (scattered/dense sensor noise when the hand is
+# absent or still). Measurement chain that motivates this exact fix:
+#   * gc_motion probe: the hand-crafted per-event motion descriptor is NON-
+#     discriminative — FP(noise) and TP(hand) local-motion distributions are identical
+#     (planarity 0.12 vs 0.11), so local cues cannot separate hand from dense noise.
+#   * A background-activity denoise prefilter (Liu-Delbruck spatiotemporal correlation)
+#     is ALSO a dead end at this sensor's sparsity: k>=2 removes 81% of no-motion FPs
+#     but ALSO 54% of true hand events (the hand's own events are sparse). Input
+#     denoising hits the same wall as the motion feature.
+#   * The ONLY separator is GLOBAL connected-blob shape. A linear probe on the FROZEN
+#     gc global-context descriptor already separates hand-present vs no-hand windows at
+#     TEST AUC = 1.000 (precision/recall 0.993). The "is a hand present?" signal is
+#     ALREADY computed inside the model — the per-event head just never uses it to gate.
+#   * The data supports a trainable null state: 11.9% of train windows have the hand
+#     ABSENT (empty mask), 12.2% are no-motion. (project memory:
+#     event-seg-motion-feature-nondiscriminative)
+#
+# THE FIX (presence_gate): a single image-level "is a moving hand present in this
+# window?" logit, read from the masked global-average of the dense context, supervised
+# by BCE against whether the window has any foreground event. Its log-sigmoid is ADDED
+# to EVERY per-event logit (suppress-only: present->+0, absent->large negative), so a
+# no-hand window suppresses all its events at once. Active at train AND inference (the
+# gate uses the PREDICTED presence, never a label). Cost = one tiny MLP on the global
+# descriptor; ~zero inference cost. Recall cost on hand windows is ~0 (the probe puts
+# hand-present recall at 0.993, so the gate passes hand windows through).
+#
+# CLEAN ABLATION: identical to configs/hand_event_seg_sparse_gc.yaml (same loss,
+# augmentation, time_bins, window) EXCEPT presence_gate is on — so any precision gain
+# on no-motion windows is attributable to the gate alone. The presence_full variant
+# stacks the bilinear context gather + per-event shape veto on top.
+#
+# Requires spconv v2. Smoke-test the wiring first:
+#   python tools/smoke_test_event_sparse.py --model gc
+
+TRAINING:
+  deterministic: False
+  use_compile: False
+  inference_mode: False
+  seed: 42
+  max_epochs: 50
+  num_sanity_val_steps: 0
+  task: event_segmentation
+  event_loss_config:
+    bce_weight: 0.0
+    pos_weight: 2.0
+    gjs_weight: 1.0
+    gjs_pi1: 0.5
+    lovasz_weight: 1.0
+  event_eval_config:
+    thr_min: 0.05
+    thr_max: 0.95
+    thr_steps: 19
+    clean_enabled: True
+    clean_open_ksize: 3
+    clean_keep_largest: False
+    clean_min_area: 0
+  val_preview_count: 8
+
+DISTRIBUTED:
+  accelerator: gpu
+  devices: 4
+  num_nodes: 1
+  strategy: auto
+
+DATA:
+  dataset:
+    file_name: hand_event_stream_dataset
+    class_name: HandEventStreamDataset
+    dataset_init_args:
+      root_dir: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNew
+      window_ms: 36.0
+      image_height: 480
+      image_width: 640
+      held_out_subject: tuxun
+      require_teacher: True
+      action_only: False
+      mask_root: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNewTeacherMasks
+      max_events: 150000
+      boundary_ignore_px: 0
+      time_ignore_frac: 0.0
+      augmentation:
+        enabled: True
+        hflip_prob: 0.5
+        affine_prob: 0.5
+        rotate_deg: 15.0
+        scale_range: [0.85, 1.20]
+        translate_frac: 0.10
+        event_drop_prob: 0.5
+        event_drop_frac: [0.0, 0.5]
+        upsample_prob: 0.3
+        upsample_range: [1.0, 1.5]
+        vflip_prob: 0.0
+        jitter_px: 1.0
+        area_drop_prob: 0.25
+        area_drop_frac: 0.20
+        time_crop_prob: 0.25
+        time_crop_min: 0.7
+        time_reverse_prob: 0.2
+        polarity_flip_prob: 0.1
+        time_jitter: 0.01
+        noise_frac: 0.05
+        min_events: 64
+      num_classes: 1
+  dataloader:
+    batch_size: 8
+    test_batch_size: 8
+    num_workers: 8
+    persistent_workers: True
+    pin_memory: True
+    multiprocessing_context: fork
+    drop_last: True
+    shuffle_train: True
+    shuffle_val: False
+    shuffle_test: False
+
+MODEL:
+  file_name: event_sparse_seg_gc
+  class_name: EventSparseSegGC
+  model_init_args:
+    in_features: 2
+    stage_channels: [24, 32, 48, 64]
+    time_bins: 6
+    num_classes: 1
+    head_hidden: 64
+    norm: ln
+    algo: native
+    context_channels: 48
+    context_gather: True
+    aux_shape_head: True
+    aux_grid: 32
+    aux_shape_weight: 0.2
+    coord_mode: relative
+    dropout: 0.2
+    drop_path: 0.1
+    # --- THE new fix: per-window presence gate (null state) ------------------------
+    presence_gate: True
+    presence_gate_weight: 0.3           # weight of the auxiliary presence BCE
+    presence_gate_scale: 1.0            # scale on log-sigmoid(presence) added to logits
+    presence_min_fg: 0                  # window is "hand present" if it has > this many fg events
+
+OPTIMIZER:
+  name: AdamW
+  arguments:
+    lr: 3e-4
+    weight_decay: 1e-4
+  gradient_accumulation:
+    enabled: False
+    scheduling: {0: 4, 4: 2, 8: 1}
+  gradient_clip:
+    enabled: True
+    gradient_clip_val: 1.0
+    gradient_clip_algorithm: norm
+  stochastic_weight_averaging:
+    enabled: True
+    swa_lrs: 1e-4
+
+SCHEDULER:
+  learning_rate:
+    enabled: True
+    name: CosineAnnealingLR
+    arguments:
+      T_max: 50
+      eta_min: 1e-6
+  early_stopping:
+    enabled: False
+    monitor: val_loss_epoch
+    mode: min
+    patience: 5
+    min_delta: 1e-5
+
+LOGGER:
+  log_dir_root: lightning_logs
+  experiment_name: hand_event_seg_sparse_gc_presence
+
+CHECKPOINT:
+  enabled: True
+  every_n_epochs: 1
+  monitor: val_event_f1_epoch
+  mode: max
+  filename: "best-{epoch:03d}-{val_event_f1_epoch:.4f}"
+  save_top_k: 1
+  save_last: True

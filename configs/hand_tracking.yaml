@@ -86,7 +86,7 @@ MODEL:
   file_name: event_track_unet
   class_name: EventTrackUnet
   model_init_args:
-    in_channels: 10                 # = voxel_bins
+    in_channels: 10                 # = voxel_bins (default signed polarity voxel)
     # Same backbone widths as the per-frame EventUnet (~0.65M) plus the ConvGRU
     # memory (~0.15M) → ~0.8M params total. Bump to [64,128,192,256] if mask
     # quality is capacity-limited.

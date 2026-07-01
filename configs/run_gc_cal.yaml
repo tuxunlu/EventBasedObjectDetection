@@ -1,0 +1,155 @@
+TRAINING:
+  deterministic: false
+  use_compile: false
+  inference_mode: false
+  seed: 42
+  max_epochs: 50
+  num_sanity_val_steps: 0
+  task: event_segmentation
+  event_loss_config:
+    bce_weight: 0.0
+    pos_weight: 2.0
+    gjs_weight: 1.0
+    gjs_pi1: 0.5
+    lovasz_weight: 1.0
+  event_eval_config:
+    thr_min: 0.05
+    thr_max: 0.95
+    thr_steps: 19
+    clean_enabled: true
+    clean_open_ksize: 3
+    clean_keep_largest: false
+    clean_min_area: 0
+  val_preview_count: 8
+  val_check_interval: 4000
+  limit_val_batches: 1000
+DISTRIBUTED:
+  accelerator: gpu
+  devices: 1
+  num_nodes: 1
+  strategy: auto
+DATA:
+  dataset:
+    file_name: hand_event_stream_dataset
+    class_name: HandEventStreamDataset
+    dataset_init_args:
+      root_dir: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNew
+      window_ms: 36.0
+      image_height: 480
+      image_width: 640
+      held_out_subject: tuxun
+      require_teacher: true
+      action_only: false
+      mask_root: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNewTeacherMasks
+      max_events: 150000
+      boundary_ignore_px: 0
+      time_ignore_frac: 0.0
+      augmentation:
+        enabled: true
+        hflip_prob: 0.5
+        affine_prob: 0.5
+        rotate_deg: 15.0
+        scale_range:
+        - 0.85
+        - 1.2
+        translate_frac: 0.1
+        event_drop_prob: 0.5
+        event_drop_frac:
+        - 0.0
+        - 0.5
+        upsample_prob: 0.3
+        upsample_range:
+        - 1.0
+        - 1.5
+        vflip_prob: 0.0
+        jitter_px: 1.0
+        area_drop_prob: 0.25
+        area_drop_frac: 0.2
+        time_crop_prob: 0.25
+        time_crop_min: 0.7
+        time_reverse_prob: 0.2
+        polarity_flip_prob: 0.1
+        time_jitter: 0.01
+        noise_frac: 0.05
+        min_events: 64
+      num_classes: 1
+  dataloader:
+    batch_size: 8
+    test_batch_size: 8
+    num_workers: 8
+    persistent_workers: true
+    pin_memory: true
+    multiprocessing_context: fork
+    drop_last: true
+    shuffle_train: true
+    shuffle_val: false
+    shuffle_test: false
+MODEL:
+  file_name: event_sparse_seg_gc
+  class_name: EventSparseSegGC
+  model_init_args:
+    in_features: 2
+    stage_channels:
+    - 24
+    - 32
+    - 48
+    - 64
+    time_bins: 6
+    num_classes: 1
+    head_hidden: 64
+    norm: ln
+    algo: native
+    context_channels: 48
+    context_gather: true
+    aux_shape_head: true
+    aux_grid: 32
+    aux_shape_weight: 0.2
+    coord_mode: relative
+    dropout: 0.2
+    drop_path: 0.1
+    presence_gate: true
+    presence_gate_weight: 0.3
+    presence_gate_scale: 1.0
+    presence_min_fg: 0
+OPTIMIZER:
+  name: AdamW
+  arguments:
+    lr: 0.0003
+    weight_decay: 0.0001
+  gradient_accumulation:
+    enabled: false
+    scheduling:
+      0: 4
+      4: 2
+      8: 1
+  gradient_clip:
+    enabled: true
+    gradient_clip_val: 1.0
+    gradient_clip_algorithm: norm
+  stochastic_weight_averaging:
+    enabled: true
+    swa_lrs: 0.0001
+SCHEDULER:
+  learning_rate:
+    enabled: true
+    name: CosineAnnealingLR
+    arguments:
+      T_max: 50
+      eta_min: 1.0e-06
+  early_stopping:
+    enabled: false
+    monitor: val_loss_epoch
+    mode: min
+    patience: 5
+    min_delta: 1.0e-05
+LOGGER:
+  log_dir_root: lightning_logs
+  experiment_name: run_gc_cal
+CHECKPOINT:
+  enabled: true
+  every_n_epochs: 1
+  monitor: val_event_f1_epoch
+  mode: max
+  filename: best-{epoch:03d}-{val_event_f1_epoch:.4f}
+  save_top_k: 1
+  save_last: true

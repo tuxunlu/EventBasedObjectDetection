@@ -1,0 +1,180 @@
+# Event-native 3D per-event segmentation — GLOBAL-CONTEXT model + FIX A.
+#
+# Goal of this run (Fix A: teach a real NO-HAND null state)
+# ---------------------------------------------------------
+# The first global-context run (EventSparseSegGC, 20260623) fixed the motion-tail
+# false positives but regressed two ways (project memory event-seg-gc-static-fp-
+# overfit): on STATIC/quiet windows it paints a hand-shaped blob (~14x the baseline's
+# quiet-frame FP), and it overfits ~2x from epoch 0. NOTE (measured): teacher-mask
+# coverage is 100%, so require_teacher:True/False is a NO-OP on the frame set — and
+# ~12% of train frames already have an empty (no-hand) mask, ~91% of them event-busy
+# (the hard kind). The model still hallucinates, so the deficit is NOT "no negatives
+# exist": its purely ADDITIVE global prior cannot be vetoed by passive exposure.
+#
+# Fix A REBALANCES toward the null state with a new event-native augmentation,
+# ``hand_drop`` (data/event_augment.py): with prob ``hand_drop_prob`` a hand-present
+# window is converted into a NO-HAND negative by dropping every foreground event and
+# zeroing the remaining (background) labels. Two things passive empty-mask frames
+# cannot give: (1) SCENE-PAIRED negatives — the SAME busy scene with vs. without the
+# hand, which directly breaks "this scene => hand" memorization (the OVERFIT); and
+# (2) guaranteed-clean labels (an empty teacher mask may be a failure on a hand-
+# present frame; removing KNOWN foreground is not). It also lets you oversample the
+# no-hand fraction past the passive ~12%.
+#
+# This config = the EventSparseSegGC architecture UNCHANGED + Fix A + the harder
+# augmentation block below (shared verbatim with the gc_ab / gc_ml runs, so the three
+# differ ONLY in the model). Smoke-test first:
+#   python tools/smoke_test_event_sparse.py --model gc
+
+TRAINING:
+  deterministic: False
+  use_compile: False          # torch.compile + spconv custom ops don't mix
+  inference_mode: False
+  seed: 42
+  max_epochs: 50
+  num_sanity_val_steps: 0
+  task: event_segmentation
+  # LOSS: identical to the 0.654 GJS baseline (GJS + per-sample Lovász, pos_weight 2.0)
+  # so the static-FP fix stays attributable to the data/aug change, not the loss.
+  event_loss_config:
+    bce_weight: 0.0
+    pos_weight: 2.0
+    gjs_weight: 1.0
+    gjs_pi1: 0.5
+    lovasz_weight: 1.0
+  event_eval_config:
+    thr_min: 0.05
+    thr_max: 0.95
+    thr_steps: 19
+    clean_enabled: True
+    clean_open_ksize: 3
+    clean_keep_largest: False
+    clean_min_area: 0
+  val_preview_count: 8
+
+DISTRIBUTED:
+  accelerator: gpu
+  devices: 4
+  num_nodes: 1
+  strategy: auto
+
+DATA:
+  dataset:
+    file_name: hand_event_stream_dataset
+    class_name: HandEventStreamDataset
+    dataset_init_args:
+      root_dir: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNew
+      window_ms: 36.0
+      image_height: 480
+      image_width: 640
+      held_out_subject: tuxun
+      require_teacher: True
+      action_only: False
+      mask_root: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNewTeacherMasks
+      max_events: 150000
+      boundary_ignore_px: 0
+      time_ignore_frac: 0.0
+      # HARDER event-native augmentation + Fix A no-hand negatives. Shared verbatim
+      # with gc_ab / gc_ml so the three runs differ only in the model. Stronger
+      # geometric/density/occlusion/noise than the baseline to close the cross-subject
+      # LOSO gap; hand_drop_prob adds the NO-HAND null-state negatives.
+      augmentation:
+        enabled: True
+        hflip_prob: 0.5
+        vflip_prob: 0.0
+        affine_prob: 0.6
+        rotate_deg: 20.0
+        scale_range: [0.75, 1.35]
+        translate_frac: 0.15
+        jitter_px: 1.5
+        event_drop_prob: 0.6
+        event_drop_frac: [0.0, 0.6]
+        upsample_prob: 0.3
+        upsample_range: [1.0, 1.6]
+        area_drop_prob: 0.35
+        area_drop_frac: 0.22
+        area_drop_count: 2            # multiple occlusion boxes (harder occlusion)
+        time_crop_prob: 0.35
+        time_crop_min: 0.6
+        time_reverse_prob: 0.2
+        polarity_flip_prob: 0.1
+        time_jitter: 0.015
+        noise_frac: 0.10
+        min_events: 64
+        hand_drop_prob: 0.20          # Fix A: fraction of windows made NO-HAND negatives
+        hand_drop_dilate_px: 0        # also drop bg events within N px of any fg event
+      num_classes: 1
+  dataloader:
+    batch_size: 8
+    test_batch_size: 8
+    num_workers: 8
+    persistent_workers: True
+    pin_memory: True
+    multiprocessing_context: fork
+    drop_last: True
+    shuffle_train: True
+    shuffle_val: False
+    shuffle_test: False
+
+MODEL:
+  file_name: event_sparse_seg_gc
+  class_name: EventSparseSegGC
+  model_init_args:
+    in_features: 2
+    stage_channels: [24, 32, 48, 64]
+    time_bins: 6
+    num_classes: 1
+    head_hidden: 64
+    norm: ln
+    algo: native
+    context_channels: 48
+    context_gather: True
+    aux_shape_head: True
+    aux_grid: 32
+    aux_shape_weight: 0.2
+    coord_mode: relative
+    dropout: 0.2
+    drop_path: 0.1
+
+OPTIMIZER:
+  name: AdamW
+  arguments:
+    lr: 3e-4
+    weight_decay: 1e-4
+  gradient_accumulation:
+    enabled: False
+    scheduling: {0: 4, 4: 2, 8: 1}
+  gradient_clip:
+    enabled: True
+    gradient_clip_val: 1.0
+    gradient_clip_algorithm: norm
+  stochastic_weight_averaging:
+    enabled: True
+    swa_lrs: 1e-4
+
+SCHEDULER:
+  learning_rate:
+    enabled: True
+    name: CosineAnnealingLR
+    arguments:
+      T_max: 50
+      eta_min: 1e-6
+  early_stopping:
+    enabled: False
+    monitor: val_loss_epoch
+    mode: min
+    patience: 5
+    min_delta: 1e-5
+
+LOGGER:
+  log_dir_root: lightning_logs
+  experiment_name: hand_event_seg_sparse_gc_a
+
+CHECKPOINT:
+  enabled: True
+  every_n_epochs: 1
+  monitor: val_event_f1_epoch
+  mode: max
+  filename: "best-{epoch:03d}-{val_event_f1_epoch:.4f}"
+  save_top_k: 1
+  save_last: True

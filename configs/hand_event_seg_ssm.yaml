@@ -1,0 +1,120 @@
+# Koopman/SSM event segmenter: HandEventDataset voxel (time-bins = Koopman snapshots) ->
+# EventSSMSeg (complex-diagonal SSM over time = structured Koopman operator + DMD-style
+# static-vs-dynamic veto) -> (N,1,H,W) mask, BCE+Dice on cached SAM2 masks. task=
+# segmentation routes to ModelInterface._segmentation_step (3-tuple voxel/mask batch).
+#
+# Dataloader note: voxel_bins=16 (vs the default 5) is the "better dataloader for its
+# purpose" — a finer Koopman snapshot SEQUENCE for the SSM/DMD; HandEventDataset already
+# emits voxel channels = TIME bins, so no new dataset class is needed.
+
+TRAINING:
+  deterministic: False
+  use_compile: False
+  inference_mode: False
+  seed: 42
+  max_epochs: 50
+  task: segmentation
+  seg_pos_weight: null
+  val_preview_count: 4
+
+DISTRIBUTED:
+  accelerator: gpu
+  devices: 4
+  num_nodes: 1
+  strategy: auto
+
+DATA:
+  dataset:
+    file_name: hand_event_dataset
+    class_name: HandEventDataset
+    dataset_init_args:
+      root_dir: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNew
+      voxel_bins: 16              # K = number of Koopman/SSM time-snapshots (finer = richer dynamics)
+      window_ms: 36.0
+      image_height: 240
+      image_width: 320
+      held_out_subject: tuxun
+      require_teacher: True
+      action_only: True
+      mask_root: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNewTeacherMasks
+      provide_rgb: False
+      num_classes: 1
+      split_mode: loso            # 'all' to pool all subjects (in-distribution holdout)
+      val_frac: 0.1
+      test_frac: 0.1
+      split_seed: 42
+      augmentation:
+        enabled: True
+        hflip_prob: 0.5
+        affine_prob: 0.5
+        rotate_deg: 10.0
+        scale_range: [0.9, 1.1]
+        translate_frac: 0.05
+  dataloader:
+    batch_size: 16
+    test_batch_size: 8
+    num_workers: 8
+    persistent_workers: True
+    pin_memory: True
+    multiprocessing_context: fork
+    drop_last: True
+    shuffle_train: True
+    shuffle_val: False
+    shuffle_test: False
+
+MODEL:
+  file_name: event_ssm_seg
+  class_name: EventSSMSeg
+  model_init_args:
+    stem_channels: [32, 64]       # per-slice spatial stem (/4) -> 64-ch features
+    d_state: 64                   # complex-diagonal SSM modes (Koopman eigenvalues)
+    dec_channels: [64, 32]        # decoder upsample widths (/4 -> full res)
+    num_classes: 1
+    gn_groups: 8
+    dmd_gate: True                # DMD static-vs-dynamic veto (zero-mode/low-variance -> suppress)
+    dmd_gate_scale: 1.0
+    presence_gate: True
+    presence_gate_scale: 1.0
+
+OPTIMIZER:
+  name: AdamW
+  arguments:
+    lr: 3e-4
+    weight_decay: 1e-4
+  gradient_accumulation:
+    enabled: False
+    scheduling: {0: 4, 4: 2, 8: 1}
+  gradient_clip:
+    enabled: True
+    gradient_clip_val: 1.0
+    gradient_clip_algorithm: norm
+  stochastic_weight_averaging:
+    enabled: False
+    swa_lrs: 1e-2
+
+SCHEDULER:
+  learning_rate:
+    enabled: True
+    name: CosineAnnealingLR
+    arguments:
+      T_max: 50
+      eta_min: 1e-6
+  early_stopping:
+    enabled: False
+    monitor: val_loss_epoch
+    mode: min
+    patience: 5
+    min_delta: 1e-5
+
+LOGGER:
+  log_dir_root: lightning_logs
+  experiment_name: hand_seg_ssm_koopman
+
+CHECKPOINT:
+  enabled: True
+  every_n_epochs: 1
+  monitor: val_iou_epoch
+  mode: max
+  filename: "best-{epoch:03d}-{val_iou_epoch:.4f}"
+  save_top_k: 1
+  save_last: True

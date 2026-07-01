@@ -1,0 +1,182 @@
+# Event-native 3D per-event segmentation — GLOBAL-CONTEXT model + MOTION cue + NULL loss.
+#
+# Why this run
+# ------------
+# Measured result (project memory event-seg-gc-fixes-flat-precision): Fix A
+# (hand_drop), Fix A+B (veto gate), the multi-level model, and harder augs did NOT
+# reduce the false positives — val precision was flat to noise (0.676 -> 0.672) and
+# only recall dropped. All four tuned the SAME global spatial-shape prior, which is
+# additive, coarse, overfit, and — critically — carries NO MOTION SIGNAL. Locally a
+# busy/clutter/wake event and a hand event are ~identical; the only thing that cleanly
+# separates them is PER-EVENT MOTION COHERENCE, which none of the prior variants had.
+#
+# This run adds exactly that missing signal, two cheap inference-time-free levers on
+# the UNCHANGED EventSparseSegGC architecture:
+#   1. motion_features: a per-event normal-flow / time-surface descriptor (|grad t| =
+#      inverse normal-flow speed, planarity = motion coherence, local correlation
+#      count) computed by an occupancy-weighted local plane fit on the Surface of
+#      Active Events (Benosman TNNLS 2014), vectorized as fixed-kernel 2D convs.
+#      Static-scene / noise events score ~0 motion -> the head gets a real "is this
+#      moving" input, not just static spatial shape.
+#   2. null_loss_weight: a background-prototype discriminative NULL loss (pull bg
+#      events to a tight per-window cluster, push fg away by a margin) — an explicit
+#      no-hand state for the quiet-window blob that boundary/aug levers cannot give.
+#
+# CLEAN ABLATION: everything below MATCHES the baseline gc run (configs/
+# hand_event_seg_sparse_gc.yaml) — same loss (GJS + Lovász, pos_weight 2.0), same
+# augmentation, time_bins 6, window_ms 36, same regularizers — EXCEPT the two new
+# model_init_args, so any delta is attributable to the motion cue + null loss.
+# Smoke-test the wiring first:
+#   python tools/smoke_test_event_sparse.py --model gc   # then the motion path below
+
+TRAINING:
+  deterministic: False
+  use_compile: False
+  inference_mode: False
+  seed: 42
+  max_epochs: 50
+  num_sanity_val_steps: 0
+  task: event_segmentation
+  event_loss_config:
+    bce_weight: 0.0
+    pos_weight: 2.0
+    gjs_weight: 1.0
+    gjs_pi1: 0.5
+    lovasz_weight: 1.0
+  event_eval_config:
+    thr_min: 0.05
+    thr_max: 0.95
+    thr_steps: 19
+    clean_enabled: True
+    clean_open_ksize: 3
+    clean_keep_largest: False
+    clean_min_area: 0
+  val_preview_count: 8
+
+DISTRIBUTED:
+  accelerator: gpu
+  devices: 4
+  num_nodes: 1
+  strategy: auto
+
+DATA:
+  dataset:
+    file_name: hand_event_stream_dataset
+    class_name: HandEventStreamDataset
+    dataset_init_args:
+      root_dir: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNew
+      window_ms: 36.0
+      image_height: 480
+      image_width: 640
+      held_out_subject: tuxun
+      require_teacher: True
+      action_only: False
+      mask_root: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNewTeacherMasks
+      max_events: 150000
+      boundary_ignore_px: 0
+      time_ignore_frac: 0.0
+      # Identical to the baseline gc augmentation (clean ablation).
+      augmentation:
+        enabled: True
+        hflip_prob: 0.5
+        affine_prob: 0.5
+        rotate_deg: 15.0
+        scale_range: [0.85, 1.20]
+        translate_frac: 0.10
+        event_drop_prob: 0.5
+        event_drop_frac: [0.0, 0.5]
+        upsample_prob: 0.3
+        upsample_range: [1.0, 1.5]
+        vflip_prob: 0.0
+        jitter_px: 1.0
+        area_drop_prob: 0.25
+        area_drop_frac: 0.20
+        time_crop_prob: 0.25
+        time_crop_min: 0.7
+        time_reverse_prob: 0.2
+        polarity_flip_prob: 0.1
+        time_jitter: 0.01
+        noise_frac: 0.05
+        min_events: 64
+      num_classes: 1
+  dataloader:
+    batch_size: 8
+    test_batch_size: 8
+    num_workers: 8
+    persistent_workers: True
+    pin_memory: True
+    multiprocessing_context: fork
+    drop_last: True
+    shuffle_train: True
+    shuffle_val: False
+    shuffle_test: False
+
+MODEL:
+  file_name: event_sparse_seg_gc
+  class_name: EventSparseSegGC
+  model_init_args:
+    in_features: 2
+    stage_channels: [24, 32, 48, 64]
+    time_bins: 6
+    num_classes: 1
+    head_hidden: 64
+    norm: ln
+    algo: native
+    context_channels: 48
+    context_gather: True
+    aux_shape_head: True
+    aux_grid: 32
+    aux_shape_weight: 0.2
+    coord_mode: relative
+    dropout: 0.2
+    drop_path: 0.1
+    # --- NEW: per-event motion cue (normal-flow / time-surface descriptor) ----------
+    motion_features: True
+    motion_radius: 3            # (2r+1)=7px neighborhood for the local plane fit
+    motion_dir: False           # add the 2 unit normal-flow direction channels if True
+    # --- NEW: background-prototype null state (kills the quiet-window blob) ----------
+    null_loss_weight: 0.5       # weight on the pull-push null loss (train only)
+    null_margin: 1.0            # min embedding distance fg must keep from the bg prototype
+
+OPTIMIZER:
+  name: AdamW
+  arguments:
+    lr: 3e-4
+    weight_decay: 1e-4
+  gradient_accumulation:
+    enabled: False
+    scheduling: {0: 4, 4: 2, 8: 1}
+  gradient_clip:
+    enabled: True
+    gradient_clip_val: 1.0
+    gradient_clip_algorithm: norm
+  stochastic_weight_averaging:
+    enabled: True
+    swa_lrs: 1e-4
+
+SCHEDULER:
+  learning_rate:
+    enabled: True
+    name: CosineAnnealingLR
+    arguments:
+      T_max: 50
+      eta_min: 1e-6
+  early_stopping:
+    enabled: False
+    monitor: val_loss_epoch
+    mode: min
+    patience: 5
+    min_delta: 1e-5
+
+LOGGER:
+  log_dir_root: lightning_logs
+  experiment_name: hand_event_seg_sparse_gc_motion
+
+CHECKPOINT:
+  enabled: True
+  every_n_epochs: 1
+  monitor: val_event_f1_epoch
+  mode: max
+  filename: "best-{epoch:03d}-{val_event_f1_epoch:.4f}"
+  save_top_k: 1
+  save_last: True

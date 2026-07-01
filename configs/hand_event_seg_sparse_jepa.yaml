@@ -1,0 +1,209 @@
+# Event-native per-event segmentation — FROM-SCRATCH JEPA model (EventJEPASeg).
+#
+# Why this run
+# ------------
+# The sparse-conv global-context family could NOT reduce the false positives —
+# every variant tuned the same additive/coarse/overfit global prior with no motion
+# signal, so precision stayed flat (memory event-seg-gc-fixes-flat-precision). This
+# is a clean-slate, LOW-POWER alternative: no spconv, no dense U-Net. It is a per-event
+# MLP + a small transformer over ~300 coarse patch tokens, with a JEPA (Joint-Embedding
+# Predictive Architecture) train-only pretext that forces the encoder to model motion/
+# dynamics instead of static appearance (the appearance shortcut behind the static-blob
+# FPs). Each token is a mini-PointNet over its events' [polarity, time, relative-xy,
+# local normal-flow motion] features, so motion is first-class. Inference drops the JEPA
+# predictor + EMA target encoder: ~210 FPS vs ~38 FPS for the GC model at 40k events,
+# 493k params, runs on CPU. Smoke-test first:
+#   python tools/smoke_test_event_sparse.py --model jepa --events 40000 --bench
+
+TRAINING:
+  deterministic: False
+  use_compile: False
+  inference_mode: False
+  seed: 42
+  max_epochs: 50
+  num_sanity_val_steps: 0
+  task: event_segmentation
+  # Per-event seg loss identical to the gc baseline (GJS + Lovász, pos_weight 2.0); the
+  # JEPA latent-prediction loss is added on top (weight = model jepa_weight) train-only.
+  event_loss_config:
+    bce_weight: 0.0
+    pos_weight: 2.0
+    gjs_weight: 1.0
+    gjs_pi1: 0.5
+    lovasz_weight: 1.0
+  # Fixed threshold 0.5 (NOT a 19-threshold per-epoch argmax) — the per-epoch sweep
+  # leaks model/threshold selection onto the held-out subject and makes <0.01 ablation
+  # deltas uninterpretable (memory loso-ceiling-and-eval-leak). (Plan §7.)
+  event_eval_config:
+    thr_min: 0.5
+    thr_max: 0.5
+    thr_steps: 1
+    clean_enabled: True
+    clean_open_ksize: 3
+    clean_keep_largest: False
+    clean_min_area: 0
+  val_preview_count: 8
+
+DISTRIBUTED:
+  accelerator: gpu
+  devices: 4
+  num_nodes: 1
+  strategy: auto
+
+DATA:
+  dataset:
+    file_name: hand_event_stream_dataset
+    class_name: HandEventStreamDataset
+    dataset_init_args:
+      root_dir: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNew
+      window_ms: 144.0            # T=16 long horizon (was 36): the JEPA residual needs
+                                  # a real future to predict (hand ~1.15px/9ms-bin).
+      image_height: 480
+      image_width: 640
+      held_out_subject: tuxun
+      require_teacher: True
+      action_only: False
+      mask_root: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNewTeacherMasks
+      max_events: 200000          # 4x window ~160k events on bursts; avoid stride-subsample
+      boundary_ignore_px: 0
+      # Supervise only the center band (~+/-18ms) of the 144ms window: the per-event
+      # label comes from the SINGLE center FLIR frame, so off-center events are
+      # mislabeled. time_ignore_frac=0.375 -> ignore outer 37.5% each side (center 25%).
+      # SSL/residual/crease still use the full window. (R8.)
+      time_ignore_frac: 0.375
+      time_ignore_val: true       # apply the center-band ignore at VAL/TEST too, so the
+                                  # mislabeled off-center events don't corrupt val F1 and
+                                  # the number is comparable to the 36ms gc baseline.
+      augmentation:
+        enabled: True
+        hflip_prob: 0.5
+        affine_prob: 0.5
+        rotate_deg: 15.0
+        scale_range: [0.85, 1.20]
+        translate_frac: 0.10
+        event_drop_prob: 0.5
+        event_drop_frac: [0.0, 0.5]
+        upsample_prob: 0.3
+        upsample_range: [1.0, 1.5]
+        vflip_prob: 0.0
+        jitter_px: 1.0
+        area_drop_prob: 0.25
+        area_drop_frac: 0.20
+        time_crop_prob: 0.25
+        time_crop_min: 0.7
+        time_reverse_prob: 0.2
+        polarity_flip_prob: 0.1
+        time_jitter: 0.01
+        noise_frac: 0.05
+        min_events: 64
+      num_classes: 1
+  dataloader:
+    # 144ms window -> ~2240 tokens (T16 x ps48). Measured peak: B=8 @190k ev/win = 7.0GB
+    # on the 46GB L40S (plenty of headroom), 0.21s/step. B=8 matches the gc baseline.
+    batch_size: 8
+    test_batch_size: 8
+    num_workers: 8
+    persistent_workers: True
+    pin_memory: True
+    multiprocessing_context: fork
+    drop_last: True
+    shuffle_train: True
+    shuffle_val: False
+    shuffle_test: False
+
+MODEL:
+  file_name: event_jepa_seg
+  class_name: EventJEPASeg
+  model_init_args:
+    in_features: 2
+    num_classes: 1
+    patch_size: 32              # finer grid (~300 cells, T16 -> ~4800 tokens); with the
+                                # bilinear per-event context this removes the coarse/square
+                                # patch-boundary artifact (boundaries follow events, not the grid)
+    time_bins: 16               # spacetime tubelets over the 144ms window (9ms/bin)
+    dim: 64
+    depth: 4                    # context-encoder transformer depth
+    heads: 4
+    pred_depth: 2               # predictor depth (causal + train-only JEPA)
+    head_hidden: 64
+    dropout: 0.1
+    coord_mode: relative        # LOSO-safe centroid-relative geometry
+    # --- signed manifold (normal-flow) descriptor (per-event) ----------------------
+    motion_radius: 3
+    motion_min_count: 6
+    # --- structured residual + crease (the load-bearing features) ------------------
+    crease_feature: true        # orientation-discontinuity = motion boundary
+    residual_feature: true      # wire the causal residual into the head
+    dir_residual: true          # DIRECTIONAL residual (not scalar magnitude)
+    flow_loss_weight: 0.5       # predict future normal-flow direction in the pretext
+    # --- JEPA pretext (train-only; the causal residual pass is KEPT at inference) ---
+    jepa_weight: 0.5            # weight on the latent-prediction loss
+    jepa_mask_ratio: 0.5        # (only used by mask_mode=space ablation)
+    mask_mode: future_all       # full-frame future prediction (V-JEPA 2.1) > masked
+    ema_momentum: 0.996
+    var_weight: 1.0             # VICReg variance hinge (anti-collapse)
+    jepa_warmup_epochs: 10      # reserved: ramp jepa_weight 0->target (training-side)
+    # --- ego-motion shear-invariance (OFF in headline -> ablation #4) ---------------
+    shear_consistency: false
+    shear_max: 0.15
+    shear_weight: 0.1
+    # --- proven levers -------------------------------------------------------------
+    presence_gate: true         # validated no-motion-FP suppressor
+    presence_gate_weight: 0.3
+    presence_gate_scale: 1.0
+    presence_min_fg: 0
+    aux_shape_head: true
+    aux_grid: 32
+    aux_shape_weight: 0.2
+    null_loss_weight: 0.0
+    null_margin: 1.0
+    # --- factorized positional encoding sizes (>= grid; replaces the 262k table) ----
+    max_gy: 24
+    max_gx: 24
+    max_t: 24
+    max_tokens: 8192
+
+OPTIMIZER:
+  name: AdamW
+  arguments:
+    lr: 3e-4
+    weight_decay: 1e-4
+  gradient_accumulation:
+    enabled: False
+    scheduling: {0: 4, 4: 2, 8: 1}
+  gradient_clip:
+    enabled: True
+    gradient_clip_val: 1.0
+    gradient_clip_algorithm: norm
+  stochastic_weight_averaging:
+    enabled: True
+    swa_lrs: 1e-4
+
+SCHEDULER:
+  learning_rate:
+    enabled: True
+    name: CosineAnnealingLR
+    arguments:
+      T_max: 50
+      eta_min: 1e-6
+  early_stopping:
+    enabled: False
+    monitor: val_loss_epoch
+    mode: min
+    patience: 5
+    min_delta: 1e-5
+
+LOGGER:
+  log_dir_root: lightning_logs
+  experiment_name: hand_event_seg_sparse_jepa
+
+CHECKPOINT:
+  enabled: True
+  every_n_epochs: 1
+  monitor: val_event_f1_epoch
+  mode: max
+  # {step} keeps mid-epoch validations (val_check_interval) from overwriting each other
+  # within the single huge epoch; save_top_k=5 keeps the best few instead of just one.
+  filename: "best-e{epoch:03d}-s{step:07d}-f1{val_event_f1_epoch:.4f}"
+  save_top_k: 5
+  save_last: True

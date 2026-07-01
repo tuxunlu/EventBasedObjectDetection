@@ -1,0 +1,114 @@
+TRAINING:
+  deterministic: false
+  use_compile: false
+  inference_mode: false
+  seed: 42
+  max_epochs: 50
+  task: segmentation
+  seg_pos_weight: null
+  val_preview_count: 4
+  val_check_interval: 0.5      # validate twice per epoch (fraction is robust to epoch size)
+DISTRIBUTED:
+  accelerator: gpu
+  devices: 4
+  num_nodes: 1
+  strategy: auto
+DATA:
+  dataset:
+    file_name: hand_event_dataset
+    class_name: HandEventDataset
+    dataset_init_args:
+      root_dir: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNew
+      voxel_bins: 16
+      window_ms: 36.0
+      image_height: 240
+      image_width: 320
+      held_out_subject: tuxun
+      require_teacher: true
+      action_only: true
+      mask_root: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNewTeacherMasks
+      provide_rgb: false
+      num_classes: 1
+      split_mode: all
+      val_frac: 0.1
+      test_frac: 0.1
+      split_seed: 42
+      augmentation:
+        enabled: true
+        hflip_prob: 0.5
+        affine_prob: 0.5
+        rotate_deg: 10.0
+        scale_range:
+        - 0.9
+        - 1.1
+        translate_frac: 0.05
+  dataloader:
+    batch_size: 16
+    test_batch_size: 8
+    num_workers: 8
+    persistent_workers: true
+    pin_memory: true
+    multiprocessing_context: fork
+    drop_last: true
+    shuffle_train: true
+    shuffle_val: false
+    shuffle_test: false
+MODEL:
+  file_name: event_ssm_seg
+  class_name: EventSSMSeg
+  model_init_args:
+    stem_channels:
+    - 32
+    - 64
+    d_state: 64
+    dec_channels:
+    - 64
+    - 32
+    num_classes: 1
+    gn_groups: 8
+    dmd_gate: true
+    dmd_gate_scale: 1.0
+    presence_gate: true
+    presence_gate_scale: 1.0
+OPTIMIZER:
+  name: AdamW
+  arguments:
+    lr: 0.0003
+    weight_decay: 0.0001
+  gradient_accumulation:
+    enabled: false
+    scheduling:
+      0: 4
+      4: 2
+      8: 1
+  gradient_clip:
+    enabled: true
+    gradient_clip_val: 1.0
+    gradient_clip_algorithm: norm
+  stochastic_weight_averaging:
+    enabled: false
+    swa_lrs: 0.01
+SCHEDULER:
+  learning_rate:
+    enabled: true
+    name: CosineAnnealingLR
+    arguments:
+      T_max: 50
+      eta_min: 1.0e-06
+  early_stopping:
+    enabled: false
+    monitor: val_loss_epoch
+    mode: min
+    patience: 5
+    min_delta: 1.0e-05
+LOGGER:
+  log_dir_root: lightning_logs
+  experiment_name: run_ssm_all
+CHECKPOINT:
+  enabled: true
+  every_n_epochs: 1
+  monitor: val_iou_epoch
+  mode: max
+  filename: best-{epoch:03d}-{val_iou_epoch:.4f}
+  save_top_k: 1
+  save_last: true

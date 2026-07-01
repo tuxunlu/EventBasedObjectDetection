@@ -1,0 +1,192 @@
+# Per-EVENT Koopman/SSM hand segmentation on N-HOT3D — EventSSMSegStream
+# (event stream in, FILTERED event stream out; one logit per event, no dense-mask
+# rasterization, so no blocky "frame artifact").
+#
+# N-HOT3D ships GROUND-TRUTH per-frame hand masks (rendered from MANO), so there is no
+# SAM 2 teacher / distillation here — the supervision is the dataset's own mask
+# (data/nhot3d_event_dataset.py::NHOT3DEventDataset). Splits are the subject-disjoint
+# train/valid/test dirs shipped with the dataset (root = the Aria/ dir; ``purpose``
+# selects the split). N-HOT3D's many extra subjects should relax the 3-subject LOSO
+# diversity ceiling (project memory loso-ceiling-and-eval-leak).
+#
+# Model = EventSSMSegStream (model/event_ssm_seg_stream.py, ~975k params): a structured-
+# Koopman complex-diagonal SSM over T time-bin snapshots + a DMD-style static-vs-dynamic
+# veto + a dense global-context bottleneck + a per-window presence gate. It consumes the
+# EXACT sparse per-event contract NHOT3DEventDataset already emits (coords/feats/times/
+# labels), so no new dataloader is needed — only the MODEL section differs from the
+# EventSparseSegGC reference. The DENSE counterparts live in
+# hand_event_seg_nhot3d_jepa_frame.yaml (EventJEPAFrame) and
+# hand_event_seg_nhot3d_track_unet.yaml (EventTrackUnet).
+#
+# Smoke-test the loader first (real data, CPU):
+#   python tools/smoke_test_nhot3d.py --purpose train
+#   python tools/smoke_test_event_ssm_stream.py            # model on a synthetic batch
+
+TRAINING:
+  deterministic: False
+  use_compile: False
+  inference_mode: False
+  seed: 42
+  max_epochs: 50
+  num_sanity_val_steps: 0
+  task: event_segmentation
+  # LOSS: identical to the EventSparseSegGC reference (GJS + per-sample Lovász).
+  event_loss_config:
+    bce_weight: 0.0
+    pos_weight: 2.0
+    gjs_weight: 1.0
+    gjs_pi1: 0.5
+    lovasz_weight: 1.0
+  event_eval_config:
+    thr_min: 0.05
+    thr_max: 0.95
+    thr_steps: 19
+    clean_enabled: True
+    clean_open_ksize: 3
+    clean_keep_largest: False
+    clean_min_area: 0
+  val_preview_count: 8
+
+DISTRIBUTED:
+  accelerator: gpu
+  devices: 4
+  num_nodes: 1
+  strategy: auto
+
+DATA:
+  dataset:
+    file_name: nhot3d_event_dataset
+    class_name: NHOT3DEventDataset
+    dataset_init_args:
+      # root = the Aria/ dir holding train/ valid/ test/. ``purpose`` (injected by
+      # DataInterface) picks the split — no LOSO/held_out here (splits are on disk).
+      root_dir: /fs/nexus-projects/DVS_Actions/N-HOT3D/Aria
+      image_height: 512
+      image_width: 512
+      event_height: 260           # native event sensor; rescaled to image_* per axis
+      event_width: 346
+      frames_per_sample: 1        # 1 event chunk (~33 ms @30fps) per sample
+      max_events: 150000
+      require_mask: True
+      boundary_ignore_px: 0
+      time_ignore_frac: 0.0
+      # Event-native augmentation + Fix-A no-hand negatives. All transforms operate on
+      # raw events and carry each per-event label, so they are dataset-agnostic.
+      augmentation:
+        enabled: True
+        hflip_prob: 0.5
+        vflip_prob: 0.0
+        affine_prob: 0.6
+        rotate_deg: 20.0
+        scale_range: [0.75, 1.35]
+        translate_frac: 0.15
+        jitter_px: 1.5
+        event_drop_prob: 0.6
+        event_drop_frac: [0.0, 0.6]
+        upsample_prob: 0.3
+        upsample_range: [1.0, 1.6]
+        area_drop_prob: 0.35
+        area_drop_frac: 0.22
+        area_drop_count: 2
+        time_crop_prob: 0.35
+        time_crop_min: 0.6
+        time_reverse_prob: 0.2
+        polarity_flip_prob: 0.1
+        time_jitter: 0.015
+        noise_frac: 0.10
+        min_events: 64
+        hand_drop_prob: 0.20
+        hand_drop_dilate_px: 0
+      num_classes: 1
+  dataloader:
+    batch_size: 8
+    test_batch_size: 8
+    num_workers: 8
+    persistent_workers: True
+    pin_memory: True
+    multiprocessing_context: fork
+    drop_last: True
+    shuffle_train: True
+    shuffle_val: False
+    shuffle_test: False
+
+MODEL:
+  file_name: event_ssm_seg_stream
+  class_name: EventSSMSegStream
+  model_init_args:
+    in_features: 2                      # (polarity, t_norm); geom/motion/sub-cell synthesized in-model
+    time_bins: 6                        # T = Koopman/SSM time-bin snapshots
+    down_factor: 4                      # coarse grid /4 (512/4 = 128 cells); 8 = cheaper, coarser
+    embed_dim: 128                      # per-event embedding = SSM model dim
+    d_state: 128                        # complex-diagonal SSM modes (Koopman eigenvalues)
+    ssm_layers: 2                       # stacked residual SSM blocks over time
+    context_channels: 128              # dense global-context width
+    context_depth: 2                    # dilated convs in the context net (spatial field)
+    head_hidden: 128
+    num_classes: 1
+    coord_mode: relative                # centroid-relative geometry (no subject-location leak)
+    motion_features: True               # per-event normal-flow plane-fit cue
+    motion_radius: 3
+    motion_dir: False
+    motion_min_count: 6
+    density_features: False
+    dropout: 0.2
+    # --- DMD static veto (the EventSSM identity) -----------------------------------
+    dmd_gate: True
+    dmd_gate_scale: 1.0
+    # --- per-window presence gate (the measured #1 FP-suppressor) ------------------
+    presence_gate: True
+    presence_gate_weight: 0.3
+    presence_gate_scale: 1.0
+    presence_min_fg: 0
+    # --- train-only structure-aware aux head (SA-SSD style; zero inference cost) ----
+    aux_shape_head: True
+    aux_grid: 32
+    aux_shape_weight: 0.2
+    # --- optional background-prototype null loss (off for the clean run) ------------
+    null_loss_weight: 0.0
+    null_margin: 1.0
+    gn_groups: 8
+
+OPTIMIZER:
+  name: AdamW
+  arguments:
+    lr: 3e-4
+    weight_decay: 1e-4
+  gradient_accumulation:
+    enabled: False
+    scheduling: {0: 4, 4: 2, 8: 1}
+  gradient_clip:
+    enabled: True
+    gradient_clip_val: 1.0
+    gradient_clip_algorithm: norm
+  stochastic_weight_averaging:
+    enabled: True
+    swa_lrs: 1e-4
+
+SCHEDULER:
+  learning_rate:
+    enabled: True
+    name: CosineAnnealingLR
+    arguments:
+      T_max: 50
+      eta_min: 1e-6
+  early_stopping:
+    enabled: False
+    monitor: val_loss_epoch
+    mode: min
+    patience: 5
+    min_delta: 1e-5
+
+LOGGER:
+  log_dir_root: lightning_logs
+  experiment_name: hand_event_seg_nhot3d_ssm_stream
+
+CHECKPOINT:
+  enabled: True
+  every_n_epochs: 1
+  monitor: val_event_f1_epoch
+  mode: max
+  filename: "best-{epoch:03d}-{val_event_f1_epoch:.4f}"
+  save_top_k: 1
+  save_last: True
