@@ -68,6 +68,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 # Reuse the baseline's dense global-context net and its GroupNorm helper verbatim.
 from model.event_ssm_seg_stream import _gn, _DenseContext
@@ -308,6 +309,7 @@ class EventStreamSegS7(nn.Module):
         boundary_loss_weight: float = 1.0,
         boundary_loss_band: int = 0,
         event_pool: int = 1,
+        use_checkpoint: bool = False,
         gn_groups: int = 8,
     ):
         super().__init__()
@@ -350,6 +352,12 @@ class EventStreamSegS7(nn.Module):
             raise NotImplementedError(
                 "event_pool>1 (event-pooling downsample) is a documented future "
                 "optimization; keep event_pool=1 in this build.")
+        # Gradient-checkpoint the selective-SSM blocks: the segmented parallel scan
+        # retains ~log2(N) complex (N, d_state) buffers per block, which dominates
+        # memory on long event streams. Checkpointing recomputes each block's scan in
+        # the backward pass instead of storing those intermediates -> ~O(blocks) memory
+        # for one extra scan recompute. Train-time only; identical outputs/grads.
+        self.use_checkpoint = bool(use_checkpoint)
 
         # Hooks read by model_interface (reset each forward).
         self._aux_logits = None
@@ -560,8 +568,16 @@ class EventStreamSegS7(nn.Module):
         per-event output back to the ORIGINAL event rows (row-alignment preserved)."""
         x = ev_embed[order]
         freqs = None
+        ckpt = self.use_checkpoint and self.training and x.requires_grad
         for blk in blocks:
-            x, freqs = blk(x, dt_ord, pos, seg_start, seg_len, max_len)
+            if ckpt:
+                # Non-reentrant checkpoint handles the int max_len arg and tuple return;
+                # recomputes the scan in backward instead of retaining its intermediates.
+                x, freqs = checkpoint(
+                    blk, x, dt_ord, pos, seg_start, seg_len, max_len,
+                    use_reentrant=False)
+            else:
+                x, freqs = blk(x, dt_ord, pos, seg_start, seg_len, max_len)
         x = norm(x)
         out = torch.empty_like(x)
         out[order] = x                       # invert the permutation -> original rows

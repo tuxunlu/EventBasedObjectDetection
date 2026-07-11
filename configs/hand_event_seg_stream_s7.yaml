@@ -64,7 +64,7 @@ DATA:
       require_teacher: True
       action_only: False
       mask_root: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNewTeacherMasks
-      max_events: 150000
+      max_events: 60000                 # per-event scan cost scales with N; 60k over 36ms is plenty (was 150k)
       boundary_ignore_px: 0
       time_ignore_frac: 0.0
       split_mode: all                   # pool all subjects (in-distribution holdout); = the 0.786 run
@@ -95,8 +95,8 @@ DATA:
         min_events: 64
       num_classes: 1
   dataloader:
-    batch_size: 8
-    test_batch_size: 8
+    batch_size: 4                       # per-event scan is memory-heavy; 4 + grad-accum (below). Lower to 2 if still OOM.
+    test_batch_size: 4
     num_workers: 8
     persistent_workers: True
     pin_memory: True
@@ -152,6 +152,7 @@ MODEL:
     boundary_loss_weight: 1.0
     boundary_loss_band: 0
     event_pool: 1                       # event-pooling downsample (future optimization; keep 1)
+    use_checkpoint: True                # gradient-checkpoint the SSM scans (big memory saver on long streams)
     gn_groups: 8
 
 OPTIMIZER:
@@ -160,7 +161,7 @@ OPTIMIZER:
     lr: 3e-4
     weight_decay: 1e-4
   gradient_accumulation:
-    enabled: False
+    enabled: True                       # keep effective batch up while batch_size is small (memory)
     scheduling: {0: 4, 4: 2, 8: 1}
   gradient_clip:
     enabled: True
