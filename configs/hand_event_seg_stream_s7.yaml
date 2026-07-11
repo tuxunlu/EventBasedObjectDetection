@@ -64,7 +64,7 @@ DATA:
       require_teacher: True
       action_only: False
       mask_root: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNewTeacherMasks
-      max_events: 60000                 # per-event scan cost scales with N; 60k over 36ms is plenty (was 150k)
+      max_events: 30000                 # per-event scan cost scales ~linearly with N; 30k over 36ms is ample (was 150k)
       boundary_ignore_px: 0
       time_ignore_frac: 0.0
       split_mode: all                   # pool all subjects (in-distribution holdout); = the 0.786 run
@@ -113,7 +113,7 @@ MODEL:
     in_features: 2                      # (polarity, t_norm); geom/motion/density/subcell/fourier synthesized in-model
     embed_dim: 128                      # per-event embedding = SSM model dim
     d_state: 64                         # selective complex-diagonal SSM modes N (S7)
-    ssm_layers: 4                       # selective-SSM blocks PER scan
+    ssm_layers: 2                       # selective-SSM blocks PER scan (was 4; scan cost is ~linear in this)
     dual_scan: True                     # add the bidirectional z-order (Morton) spatial scan
     morton_bits: 10                     # bits/axis for the fine z-order code
     time_blocks: 6                      # coarse time blocks the z-order scan is grouped within
