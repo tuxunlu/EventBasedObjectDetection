@@ -44,6 +44,8 @@ The workflow surveyed the 2024–2025 event-native backbone literature across 8 
 
 The workflow's final task produced one concrete architecture per backbone family, each required to beat the repo's ~0.79 F1 per-event baseline while keeping the mandated backbone (SSM / graph) as the *core*. Both are reproduced in full below, field-for-field as the agents returned them.
 
+> **Implementation status.** Brief A (`EventStreamSegS7`) is **built**: `model/event_stream_seg_s7.py`, config `configs/hand_event_seg_stream_s7.yaml`, smoke test `tools/smoke_test_event_stream_s7.py` (22 checks green — segmented-scan-vs-sequential correctness, no cross-sample leak, row-alignment, no-frame-artifact, full grad flow, DMD veto, LOSO-safety), plus a backward-compatible `_scan_loss`/`scan_weight` hook in `model_interface.py`. ~1.46M params. Trained: no. Brief B (`EventGraphSSMSeg`) is not yet built.
+
 ### Brief A — SSM backbone
 
 #### Backbone (one-line thesis)

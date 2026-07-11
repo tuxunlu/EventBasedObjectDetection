@@ -852,6 +852,18 @@ class ModelInterface(pl.LightningModule):
             loss = loss + jepa
             self.log(f'{stage}_jepa_loss', jepa, on_step=True, on_epoch=True,
                      prog_bar=False, sync_dist=True, batch_size=bs)
+        # Dual-scan consistency pretext (TRAIN ONLY). EventStreamSegS7 stashes a scalar
+        # agreement penalty between its time-order and z-order scans on
+        # ``self.model._scan_loss`` when ``scan_weight`` is on; add it so the two 1D
+        # scan orders are regularized toward the same per-event decision. Mirrors the
+        # ``_jepa_loss`` hook; default weight 0.0 leaves all other models unaffected.
+        sl = getattr(self.model, "_scan_loss", None)
+        sw = float(getattr(self.model, "scan_weight", 0.0))
+        if sl is not None and stage == "train" and sw > 0.0:
+            scan = sw * sl
+            loss = loss + scan
+            self.log(f'{stage}_scan_loss', scan, on_step=True, on_epoch=True,
+                     prog_bar=False, sync_dist=True, batch_size=bs)
         self.log(f'{stage}_loss', loss, on_step=True, on_epoch=True,
                  prog_bar=True, sync_dist=True, batch_size=bs)
         # Log every active sub-loss (bce/rce/gce/gjs/nrdice/asl/lovasz/...) so the

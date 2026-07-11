@@ -1,0 +1,198 @@
+# EventStreamSegS7 — TRUE event-by-event dual-order selective-SSM per-event hand
+# segmentation (Brief A of docs/deep_research_event_native_backbones_RECOVERED.md).
+#
+# What this is
+# -----------
+# The per-event evolution of EventSSMSegStream (run_ssm_stream_all.yaml, val F1 0.786).
+# The baseline scatters events into a coarse (cells, T, d) grid and scans a complex-
+# diagonal SSM over the T time-bin snapshots PER CELL. EventStreamSegS7 instead scans
+# the RAW time-ordered event stream one event at a time with a *selective* (input-
+# dependent, S7/Mamba-style) diagonal SSM + STREAM Δt-discretization, removing the
+# per-voxel-cell time quantization. A second bidirectional z-order (Morton) scan
+# restores 2D spatial locality a single 1D scan loses, and the baseline's measured
+# FP-suppressors (dense global context + presence gate + DMD static veto) are ported
+# unchanged. ~1.46M params. Pure torch (no spconv). Smoke-test first:
+#   EventBasedObjectDetection/bin/python tools/smoke_test_event_stream_s7.py
+#
+# CLEAN ABLATION: loss / eval / augmentation / window / split all MATCH
+# run_ssm_stream_all.yaml (0.786), so any delta is attributable to this architecture.
+# Follow-up knobs from the design brief (not enabled here to keep the comparison clean):
+# the richer loss recipe (tversky_weight 0.5 w/ alpha 0.7 > beta 0.3, focal), and the
+# train-only label cleanup (DATA boundary_ignore_px 2, time_ignore_frac 0.15).
+
+TRAINING:
+  deterministic: False
+  use_compile: False
+  inference_mode: False
+  seed: 42
+  max_epochs: 50
+  num_sanity_val_steps: 0
+  task: event_segmentation
+  # LOSS: identical to the 0.786 baseline (GJS + per-sample Lovász; BCE off, pos_weight 2).
+  event_loss_config:
+    bce_weight: 0.0
+    pos_weight: 2.0
+    gjs_weight: 1.0
+    gjs_pi1: 0.5
+    lovasz_weight: 1.0
+  event_eval_config:
+    thr_min: 0.05
+    thr_max: 0.95
+    thr_steps: 19
+    clean_enabled: True
+    clean_open_ksize: 3
+    clean_keep_largest: False
+    clean_min_area: 0
+  val_preview_count: 8
+
+DISTRIBUTED:
+  accelerator: gpu
+  devices: 4
+  num_nodes: 1
+  strategy: auto
+
+DATA:
+  dataset:
+    file_name: hand_event_stream_dataset
+    class_name: HandEventStreamDataset
+    dataset_init_args:
+      root_dir: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNew
+      window_ms: 36.0
+      image_height: 480
+      image_width: 640
+      held_out_subject: tuxun           # LOSO held-out subject for val/test
+      require_teacher: True
+      action_only: False
+      mask_root: /fs/nexus-projects/DVS_Actions/NatureRoboticsDataNewTeacherMasks
+      max_events: 150000
+      boundary_ignore_px: 0
+      time_ignore_frac: 0.0
+      split_mode: all                   # pool all subjects (in-distribution holdout); = the 0.786 run
+      val_frac: 0.1
+      test_frac: 0.1
+      split_seed: 42
+      augmentation:
+        enabled: True
+        hflip_prob: 0.5
+        affine_prob: 0.5
+        rotate_deg: 15.0
+        scale_range: [0.85, 1.20]
+        translate_frac: 0.10
+        event_drop_prob: 0.5
+        event_drop_frac: [0.0, 0.5]
+        upsample_prob: 0.3
+        upsample_range: [1.0, 1.5]
+        vflip_prob: 0.0
+        jitter_px: 1.0
+        area_drop_prob: 0.25
+        area_drop_frac: 0.20
+        time_crop_prob: 0.25
+        time_crop_min: 0.7
+        time_reverse_prob: 0.2
+        polarity_flip_prob: 0.1
+        time_jitter: 0.01
+        noise_frac: 0.05
+        min_events: 64
+      num_classes: 1
+  dataloader:
+    batch_size: 8
+    test_batch_size: 8
+    num_workers: 8
+    persistent_workers: True
+    pin_memory: True
+    multiprocessing_context: fork
+    drop_last: True
+    shuffle_train: True
+    shuffle_val: False
+    shuffle_test: False
+
+MODEL:
+  file_name: event_stream_seg_s7
+  class_name: EventStreamSegS7
+  model_init_args:
+    in_features: 2                      # (polarity, t_norm); geom/motion/density/subcell/fourier synthesized in-model
+    embed_dim: 128                      # per-event embedding = SSM model dim
+    d_state: 64                         # selective complex-diagonal SSM modes N (S7)
+    ssm_layers: 4                       # selective-SSM blocks PER scan
+    dual_scan: True                     # add the bidirectional z-order (Morton) spatial scan
+    morton_bits: 10                     # bits/axis for the fine z-order code
+    time_blocks: 6                      # coarse time blocks the z-order scan is grouped within
+    fourier_bands: 8                    # random-Fourier PE over (dx,dy,t)
+    down_factor: 8                      # dense-context coarse grid /8 (cheaper; 4 if memory allows)
+    context_channels: 128
+    context_depth: 2                    # dilated convs (dilations 2,4) in the context net
+    head_hidden: 128
+    num_classes: 1
+    coord_mode: relative                # centroid-relative geometry (no subject-location leak)
+    motion_features: True               # per-event normal-flow plane-fit cue
+    motion_radius: 3
+    motion_dir: False
+    motion_min_count: 6
+    density_features: True              # neighborhood density/timing channels
+    density_radius: 2
+    dropout: 0.2
+    # --- DMD static veto (ported EventSSM identity) --------------------------------
+    dmd_gate: True
+    dmd_gate_scale: 1.0
+    # --- per-window presence gate (measured #1 FP-suppressor) ----------------------
+    presence_gate: True
+    presence_gate_weight: 0.3
+    presence_gate_scale: 1.0
+    presence_min_fg: 0
+    # --- train-only structure-aware aux head (SA-SSD style; zero inference cost) ----
+    aux_shape_head: True
+    aux_grid: 32
+    aux_shape_weight: 0.2
+    # --- optional background-prototype null loss (off for the clean run) ------------
+    null_loss_weight: 0.0
+    null_margin: 1.0
+    # --- dual-scan consistency (time-order vs z-order agree per event) -------------
+    scan_weight: 0.1
+    # --- boundary emphasis (off; needs de-noised labels) ---------------------------
+    boundary_loss_weight: 1.0
+    boundary_loss_band: 0
+    event_pool: 1                       # event-pooling downsample (future optimization; keep 1)
+    gn_groups: 8
+
+OPTIMIZER:
+  name: AdamW
+  arguments:
+    lr: 3e-4
+    weight_decay: 1e-4
+  gradient_accumulation:
+    enabled: False
+    scheduling: {0: 4, 4: 2, 8: 1}
+  gradient_clip:
+    enabled: True
+    gradient_clip_val: 1.0
+    gradient_clip_algorithm: norm
+  stochastic_weight_averaging:
+    enabled: True
+    swa_lrs: 1e-4
+
+SCHEDULER:
+  learning_rate:
+    enabled: True
+    name: CosineAnnealingLR
+    arguments:
+      T_max: 50
+      eta_min: 1e-6
+  early_stopping:
+    enabled: False
+    monitor: val_loss_epoch
+    mode: min
+    patience: 5
+    min_delta: 1e-5
+
+LOGGER:
+  log_dir_root: lightning_logs
+  experiment_name: hand_event_seg_stream_s7
+
+CHECKPOINT:
+  enabled: True
+  every_n_epochs: 1
+  monitor: val_event_f1_epoch
+  mode: max
+  filename: "best-{epoch:03d}-{val_event_f1_epoch:.4f}"
+  save_top_k: 1
+  save_last: True
