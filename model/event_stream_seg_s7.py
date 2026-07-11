@@ -390,9 +390,13 @@ class EventStreamSegS7(nn.Module):
             self.zorder_blocks = nn.ModuleList(
                 _SelectiveSSMBlock(d, self.d_state, bidirectional=True) for _ in range(L))
             self.zorder_norm = nn.LayerNorm(d)
-            self.scan_probe = nn.Linear(d, 1)   # shared probe for dual-scan consistency
+            # Shared probe for the dual-scan consistency aux. Only created when the term
+            # is actually used (scan_weight>0), else it would be a dead parameter that
+            # trips DDP's unused-parameter check. scan_weight=0 => no probe, no hook needed.
+            self.scan_probe = (nn.Linear(d, 1) if self.scan_weight > 0.0 else None)
         else:
             self.zorder_blocks = None
+            self.scan_probe = None
 
         self.context = _DenseContext(d, self.context_channels, gn_groups,
                                      depth=max(1, int(context_depth)))
@@ -697,7 +701,7 @@ class EventStreamSegS7(nn.Module):
             self._event_embedding = emb
 
         # Dual-scan consistency: the two orders should predict the same per-event label.
-        if self.training and self.dual_scan and self.scan_weight > 0.0:
+        if self.training and self.scan_probe is not None and z_state is not None:
             p_t = self.scan_probe(time_state)
             p_z = self.scan_probe(z_state)
             self._scan_loss = F.mse_loss(p_t, p_z)
