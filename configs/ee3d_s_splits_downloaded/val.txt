@@ -1,0 +1,6 @@
+pose_19_01
+pose_19_07
+pose_19_10
+pose_19_12
+pose_19_13
+pose_19_15

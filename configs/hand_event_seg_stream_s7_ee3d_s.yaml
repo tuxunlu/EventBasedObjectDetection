@@ -59,7 +59,9 @@ DATA:
     class_name: EE3DEventStreamDataset
     dataset_init_args:
       root_dir: /fs/nexus-projects/DVS_Encodings/EE3D-S
-      split_dir: configs/ee3d_s_splits   # subject-disjoint train/val/test (authors ship EE3D-S train-only)
+      split_dir: configs/ee3d_s_splits_downloaded   # OWN subject-disjoint split of the DOWNLOADED units
+                                          #   (train=subj 18/24/27/28/32=25, val=subj 19=6, test=subj 26=5).
+                                          #   NOT the author-shipped configs/ee3d_s_splits (degenerate 855/4/1).
       skip_missing_units: True           # 860 units copied incrementally -> skip the not-yet-present ones
       mask_layout: pose                  # EE3D-S: <pose>/<frame>/Segmentation/<jpg>
       mask_person_is_dark: True          # inverted render: person = black silhouette on white
