@@ -124,57 +124,81 @@ class _SelectiveSSM(nn.Module):
     within-segment-reversed sequence and sums (for the non-causal spatial order).
     """
 
-    def __init__(self, d_model: int, d_state: int = 64, bidirectional: bool = False):
+    def __init__(self, d_model: int, d_state: int = 64, bidirectional: bool = False,
+                 use_complex: bool = True):
         super().__init__()
         self.d_model = int(d_model)
         self.N = int(d_state)
         self.bidirectional = bool(bidirectional)
+        # use_complex=True  -> complex-diagonal (S7/Koopman) SSM with oscillatory modes.
+        # use_complex=False -> real-diagonal ABLATION (pure exponential decay, no
+        #   frequencies). This real form is the one expressible by the real-valued
+        #   Mamba-2 SSD chunkwise kernel, so this flag is the R1 gate for the SSD rewrite
+        #   (see docs/deep_research_s7_faster_capable.md / the research plan).
+        self.use_complex = bool(use_complex)
         # Stable diagonal continuous eigenvalues (real part < 0 via -softplus).
         self.a_log = nn.Parameter(torch.log(torch.expm1(0.5 * torch.ones(self.N))))
-        self.a_im = nn.Parameter(torch.linspace(0.0, math.pi, self.N))
-        # MIMO input/output maps (real params; complex assembled in forward).
+        # MIMO input/output maps (real params; complex assembled in forward when complex).
         self.B_re = nn.Parameter(torch.randn(self.N, d_model) / math.sqrt(d_model))
-        self.B_im = nn.Parameter(torch.zeros(self.N, d_model))
         self.C_re = nn.Parameter(torch.randn(d_model, self.N) / math.sqrt(self.N))
-        self.C_im = nn.Parameter(torch.randn(d_model, self.N) / math.sqrt(self.N))
         self.D = nn.Parameter(torch.ones(d_model))
+        # The complex/oscillatory (Koopman) half: imaginary eigen-FREQUENCIES a_im and the
+        # imaginary halves of B, C. Present ONLY in complex mode; the real-diagonal ablation
+        # drops them (~2·N·d_model + N fewer params) -> a plain decay SSM, no oscillation.
+        if self.use_complex:
+            self.a_im = nn.Parameter(torch.linspace(0.0, math.pi, self.N))
+            self.B_im = nn.Parameter(torch.zeros(self.N, d_model))
+            self.C_im = nn.Parameter(torch.randn(d_model, self.N) / math.sqrt(self.N))
         # Selectivity: input-dependent Δ (scalar/event) and input gate (per mode).
         self.delta_proj = nn.Linear(d_model, 1)
         self.gate_proj = nn.Linear(d_model, self.N)
         nn.init.zeros_(self.delta_proj.weight)
         nn.init.constant_(self.delta_proj.bias, 0.0)   # softplus(0)=~0.69 initial scale
 
-    def _scan_once(self, x, dt, pos_in_seg, max_len, a_im, a_re):
+    def _scan_once(self, x, dt, pos_in_seg, max_len):
         """One directional selective scan over the ordered sequence ``x (M,d)``."""
-        A = torch.complex(a_re, a_im)                                   # (N,) continuous
-        delta = F.softplus(self.delta_proj(x).squeeze(-1)) * dt         # (M,)
-        Abar = torch.exp(A.unsqueeze(0) * delta.unsqueeze(1).to(A.dtype))  # (M,N)
-        g = F.softplus(self.gate_proj(x))                              # (M,N) input gate
-        xB = x @ self.B_re.t() + 1j * (x @ self.B_im.t())              # (M,N) complex
-        u = (delta.unsqueeze(1) * g).to(xB.dtype) * xB                 # (M,N) drive
-        h = _segmented_scan(Abar, u, pos_in_seg, max_len)             # (M,N) complex
-        C = torch.complex(self.C_re, self.C_im)                        # (d,N)
-        y = (h @ C.t()).real + x * self.D                              # (M,d)
+        a_re = -F.softplus(self.a_log)                                 # (N,) Re<0
+        delta = F.softplus(self.delta_proj(x).squeeze(-1)) * dt        # (M,)
+        g = F.softplus(self.gate_proj(x))                             # (M,N) input gate
+        if self.use_complex:
+            A = torch.complex(a_re, self.a_im)                        # (N,) continuous
+            Abar = torch.exp(A.unsqueeze(0) * delta.unsqueeze(1).to(A.dtype))  # (M,N)
+            xB = x @ self.B_re.t() + 1j * (x @ self.B_im.t())         # (M,N) complex
+            u = (delta.unsqueeze(1) * g).to(xB.dtype) * xB            # (M,N) drive
+            h = _segmented_scan(Abar, u, pos_in_seg, max_len)        # (M,N) complex
+            C = torch.complex(self.C_re, self.C_im)                   # (d,N)
+            y = (h @ C.t()).real + x * self.D                         # (M,d)
+        else:
+            # Real-diagonal: Ā = exp(a_re·Δ) ∈ (0,1); no imaginary parts, no .real cast.
+            Abar = torch.exp(a_re.unsqueeze(0) * delta.unsqueeze(1))  # (M,N) real in (0,1)
+            xB = x @ self.B_re.t()                                    # (M,N) real
+            u = (delta.unsqueeze(1) * g) * xB                         # (M,N) drive
+            h = _segmented_scan(Abar, u, pos_in_seg, max_len)        # (M,N) real
+            y = (h @ self.C_re.t()) + x * self.D                      # (M,d)
         return y
 
     def forward(self, x, dt, pos_in_seg, seg_start, seg_len, max_len):
-        a_re = -F.softplus(self.a_log)
-        y = self._scan_once(x, dt, pos_in_seg, max_len, self.a_im, a_re)
+        y = self._scan_once(x, dt, pos_in_seg, max_len)
         if self.bidirectional:
             # Reverse within each contiguous segment (an involution): position j -> len-1-j.
             rev = seg_start + (seg_len - 1 - pos_in_seg)
-            y_b = self._scan_once(x[rev], dt[rev], pos_in_seg, max_len, self.a_im, a_re)
+            y_b = self._scan_once(x[rev], dt[rev], pos_in_seg, max_len)
             y = y + y_b[rev]
-        return y, self.a_im
+        # Diagnostic "freqs" for the DMD/Koopman hooks: the imaginary eigenvalues in
+        # complex mode, zeros (no oscillation) in the real-diagonal ablation.
+        freqs = self.a_im if self.use_complex else x.new_zeros(self.N)
+        return y, freqs
 
 
 class _SelectiveSSMBlock(nn.Module):
     """Residual selective-SSM block: ``x + out_proj(SSM(norm(x)) ⊙ SiLU(gate(x)))``."""
 
-    def __init__(self, d_model: int, d_state: int, bidirectional: bool = False):
+    def __init__(self, d_model: int, d_state: int, bidirectional: bool = False,
+                 use_complex: bool = True):
         super().__init__()
         self.norm = nn.LayerNorm(d_model)
-        self.ssm = _SelectiveSSM(d_model, d_state, bidirectional=bidirectional)
+        self.ssm = _SelectiveSSM(d_model, d_state, bidirectional=bidirectional,
+                                 use_complex=use_complex)
         self.gate = nn.Linear(d_model, d_model)
         self.out_proj = nn.Linear(d_model, d_model)
 
@@ -277,6 +301,7 @@ class EventStreamSegS7(nn.Module):
         embed_dim: int = 128,
         d_state: int = 64,
         ssm_layers: int = 4,
+        use_complex: bool = True,
         dual_scan: bool = True,
         morton_bits: int = 10,
         time_blocks: int = 6,
@@ -316,6 +341,7 @@ class EventStreamSegS7(nn.Module):
         self.in_features = int(in_features)
         self.embed_dim = int(embed_dim)
         self.d_state = int(d_state)
+        self.use_complex = bool(use_complex)
         self.num_classes = int(num_classes)
         self.dual_scan = bool(dual_scan)
         self.morton_bits = int(morton_bits)
@@ -392,11 +418,13 @@ class EventStreamSegS7(nn.Module):
         )
         L = max(1, int(ssm_layers))
         self.time_blocks_mod = nn.ModuleList(
-            _SelectiveSSMBlock(d, self.d_state, bidirectional=False) for _ in range(L))
+            _SelectiveSSMBlock(d, self.d_state, bidirectional=False,
+                               use_complex=self.use_complex) for _ in range(L))
         self.time_norm = nn.LayerNorm(d)
         if self.dual_scan:
             self.zorder_blocks = nn.ModuleList(
-                _SelectiveSSMBlock(d, self.d_state, bidirectional=True) for _ in range(L))
+                _SelectiveSSMBlock(d, self.d_state, bidirectional=True,
+                                   use_complex=self.use_complex) for _ in range(L))
             self.zorder_norm = nn.LayerNorm(d)
             # Shared probe for the dual-scan consistency aux. Only created when the term
             # is actually used (scan_weight>0), else it would be a dead parameter that

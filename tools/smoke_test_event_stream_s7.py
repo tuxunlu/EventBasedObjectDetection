@@ -26,7 +26,7 @@ from torch.nn.modules.batchnorm import _BatchNorm
 from data.sparse_event_collate import collate_sparse_events
 from loss.event_distillation import EventDistillationLoss, background_prototype_loss
 from model.event_stream_seg_s7 import (
-    EventStreamSegS7, _segmented_scan, _seg_layout)
+    EventStreamSegS7, _SelectiveSSM, _segmented_scan, _seg_layout)
 
 FAILED = []
 
@@ -260,6 +260,45 @@ def main():
     with torch.no_grad():
         os = m_small(_batch(1500, 103, 149, 2, gen))
     _check("time_blocks=3 / down_factor=8 ok", torch.isfinite(os).all().item())
+
+    print("== 10. real-diagonal ablation (use_complex=False) — the R1 / SSD gate ==")
+    # Real-diagonal drops the imaginary Koopman params (a_im, B_im, C_im) per SSM; this is
+    # the form the real-valued Mamba-2 SSD kernel can express. Must stay a valid per-event
+    # segmenter (same contract) so any accuracy delta is the ablation, not a plumbing bug.
+    m_re = EventStreamSegS7(use_complex=False).eval()
+    m_cx = EventStreamSegS7(use_complex=True).eval()
+    ssms_re = [mod for mod in m_re.modules() if isinstance(mod, _SelectiveSSM)]
+    _check("real SSMs carry no imaginary params (a_im/B_im/C_im dropped)",
+           len(ssms_re) > 0 and not any(hasattr(s, "a_im") or hasattr(s, "B_im")
+                                        or hasattr(s, "C_im") for s in ssms_re))
+    _check("real-diagonal has FEWER params than complex",
+           m_re.count_parameters() < m_cx.count_parameters(),
+           f"real={m_re.count_parameters():,} < complex={m_cx.count_parameters():,}")
+    rb = _batch(3000, H, W, B, gen)
+    n_rb = rb.coords.shape[0]
+    with torch.no_grad():
+        lr = m_re(rb)
+        lr2 = m_re(rb)
+    _check("real-diagonal: one finite logit per event, deterministic",
+           tuple(lr.shape) == (n_rb,) and torch.isfinite(lr).all().item()
+           and torch.equal(lr, lr2))
+    _check("no complex-dtype parameters remain in real model",
+           not any(torch.is_complex(p) for p in m_re.parameters()))
+    _check("_freqs exposed, shape (d_state,), all-zero (no oscillation) in real mode",
+           m_re._freqs is not None and tuple(m_re._freqs.shape) == (m_re.d_state,)
+           and float(m_re._freqs.abs().max()) == 0.0)
+    # Gradient must flow through the real scan (eigen-decay a_log, Δ, gate, B_re/C_re).
+    m_re.train()
+    lr_tr = m_re(rb)
+    loss_re = loss_fn(lr_tr, rb.labels, batch_idx=rb.batch_idx)["total"]
+    loss_re.backward()
+    re_params = dict(m_re.named_parameters())
+    got_grad = [n for n in ("time_blocks_mod.0.ssm.a_log", "time_blocks_mod.0.ssm.B_re",
+                            "time_blocks_mod.0.ssm.C_re", "time_blocks_mod.0.ssm.delta_proj.weight")
+                if re_params.get(n) is not None and re_params[n].grad is not None
+                and torch.isfinite(re_params[n].grad).all()]
+    _check("real-diagonal: grad flows into a_log/B_re/C_re/delta_proj", len(got_grad) == 4,
+           f"{got_grad}")
 
     print()
     if FAILED:
