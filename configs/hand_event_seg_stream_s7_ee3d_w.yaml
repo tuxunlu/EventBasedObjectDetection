@@ -22,6 +22,13 @@ TRAINING:
   seed: 42
   max_epochs: 50
   num_sanity_val_steps: 0
+  # Val is loaded SINGLE-PROCESS (dataloader.val_num_workers: 0) to dodge the DDP
+  # val-dataloader worker-spawn deadlock (EE3D h5/memmap init hangs 4-rank forkserver even
+  # though it's fine at devices:1 / on the hand dataset). Cap the oversized val set so
+  # single-threaded loading stays fast. EE3D-W val = sessions 5,9 (large), so a bounded
+  # prefix is plenty to monitor val_event_f1.
+  # FAST SMOKE (reach validation in ~1 min instead of full epoch): add limit_train_batches: 50.
+  limit_val_batches: 300
   task: event_segmentation
   event_loss_config:
     bce_weight: 0.0
@@ -64,6 +71,7 @@ DATA:
     batch_size: 4                  # per-event scan is memory-heavy (was 8 for sparse-conv); 4 + grad-accum.
     test_batch_size: 4
     num_workers: 8
+    val_num_workers: 0             # DDP val deadlock fix: single-process val (no worker spawn). See TRAINING.limit_val_batches.
     persistent_workers: True
     pin_memory: True               # SparseEventBatch implements pin_memory()
     multiprocessing_context: forkserver   # EE3D dataset __getstate__ drops h5 handles -> picklable/safe.

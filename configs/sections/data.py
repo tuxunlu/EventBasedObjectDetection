@@ -16,6 +16,11 @@ class DataloaderConfig(TrackedConfigMixin):
     batch_size: int = 32
     test_batch_size: Optional[int] = None
     num_workers: int = 0
+    # Optional val/test-only worker override. None -> use ``num_workers``. Set to 0 to load
+    # validation single-process: this AVOIDS the DDP val-dataloader worker-spawn deadlock
+    # that heavy per-worker init (EE3D h5/memmap) triggers even with forkserver. Pair with
+    # TRAINING.limit_val_batches so single-threaded val over a large val set stays fast.
+    val_num_workers: Optional[int] = None
     persistent_workers: bool = False
     pin_memory: bool = False
     multiprocessing_context: str = "fork"

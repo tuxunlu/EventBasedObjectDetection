@@ -54,17 +54,32 @@ class DataInterface(pl.LightningDataModule):
             collate_fn=self._collate_fn,
         )
 
+    def _eval_worker_kwargs(self):
+        """Worker settings for the val/test loaders, honoring ``val_num_workers``.
+
+        ``val_num_workers`` (None -> ``num_workers``) lets validation run with FEWER or ZERO
+        workers than training. With 0 workers PyTorch forbids ``persistent_workers=True`` and
+        a non-None ``multiprocessing_context``, so both are neutralized here. Setting it to 0
+        is the robust fix for the DDP val-dataloader worker-spawn deadlock (see data.py)."""
+        workers = self.dataloader_cfg.val_num_workers
+        if workers is None:
+            workers = self.dataloader_cfg.num_workers
+        persistent = self.dataloader_cfg.persistent_workers and workers > 0
+        mp_ctx = self.dataloader_cfg.multiprocessing_context if workers > 0 else None
+        return workers, persistent, mp_ctx
+
     # Lightning hook function, override to implement loading validation dataset
     def val_dataloader(self):
         test_batch = self.dataloader_cfg.test_batch_size or self.dataloader_cfg.batch_size
+        workers, persistent, mp_ctx = self._eval_worker_kwargs()
         return DataLoader(
             dataset=self.validation_set,
             batch_size=test_batch,
-            num_workers=self.dataloader_cfg.num_workers,
+            num_workers=workers,
             shuffle=self.dataloader_cfg.shuffle_val,
-            persistent_workers=self.dataloader_cfg.persistent_workers,
+            persistent_workers=persistent,
             pin_memory=self.dataloader_cfg.pin_memory,
-            multiprocessing_context=self.dataloader_cfg.multiprocessing_context,
+            multiprocessing_context=mp_ctx,
             drop_last=self.dataloader_cfg.drop_last,
             collate_fn=self._collate_fn,
         )
@@ -72,14 +87,15 @@ class DataInterface(pl.LightningDataModule):
     # Lightning hook function, override to implement loading test dataset
     def test_dataloader(self):
         test_batch = self.dataloader_cfg.test_batch_size or self.dataloader_cfg.batch_size
+        workers, persistent, mp_ctx = self._eval_worker_kwargs()
         return DataLoader(
             dataset=self.test_set,
             batch_size=test_batch,
-            num_workers=self.dataloader_cfg.num_workers,
+            num_workers=workers,
             shuffle=self.dataloader_cfg.shuffle_test,
-            persistent_workers=self.dataloader_cfg.persistent_workers,
+            persistent_workers=persistent,
             pin_memory=self.dataloader_cfg.pin_memory,
-            multiprocessing_context=self.dataloader_cfg.multiprocessing_context,
+            multiprocessing_context=mp_ctx,
             drop_last=self.dataloader_cfg.drop_last,
             collate_fn=self._collate_fn,
         )
