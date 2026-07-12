@@ -1,0 +1,164 @@
+# EventStreamSegS7 on EventEgo3D++ / EE3D-S (SYNTHETIC egocentric FISHEYE person seg).
+# ---------------------------------------------------------------------------------------
+# Port of hand_event_seg_stream_s7.yaml to the EE3D per-event sparse loader
+# (EE3DEventStreamDataset), synthetic variant. S7 reads the SAME SparseEventBatch as
+# EventSparseSeg (ee3d_s_event_seg.yaml, the baseline on this data) — drop-in DATA swap.
+# The per-event label is the FREE binary seg_idx shipped per event (no SAM2 needed).
+# Splits are subject-disjoint via configs/ee3d_s_splits (authors ship EE3D-S train-only, so
+# val/test are small on purpose). Masks are INVERTED (person=dark). Smoke-test:
+#   EventBasedObjectDetection/bin/python tools/smoke_test_event_stream_s7.py
+#
+# FISHEYE: geometric augmentation is INVALID here (kept OFF below) — do NOT enable
+# hflip/affine/rotate/scale/translate. EE3D-W is PERSON (full-body) segmentation, not hand.
+#
+# FAST PROFILE (~7-14x, pure torch) once accuracy is confirmed: set
+#   model_init_args.use_complex: False + dual_scan: False + use_checkpoint: False
+# (see hand_event_seg_stream_s7_fast.yaml / tools/profile_s7_step.py). Kept OFF here so a
+# first run isolates "does S7 learn on EE3D" from "does real-diagonal hold accuracy".
+
+TRAINING:
+  deterministic: False
+  use_compile: False
+  inference_mode: False
+  seed: 42
+  max_epochs: 50
+  num_sanity_val_steps: 0
+  task: event_segmentation
+  event_loss_config:
+    bce_weight: 0.0
+    pos_weight: 2.0                    # person fg is larger than hand; pos_weight can be lowered to ~1.
+    gjs_weight: 1.0
+    gjs_pi1: 0.5
+    lovasz_weight: 1.0
+  event_eval_config:
+    thr_min: 0.05
+    thr_max: 0.95
+    thr_steps: 19
+    clean_enabled: True
+    clean_open_ksize: 3
+    clean_keep_largest: False
+    clean_min_area: 0
+  val_preview_count: 8
+
+DISTRIBUTED:
+  accelerator: gpu
+  devices: 4
+  num_nodes: 1
+  strategy: auto
+
+DATA:
+  dataset:
+    file_name: ee3d_event_dataset
+    class_name: EE3DEventStreamDataset
+    dataset_init_args:
+      root_dir: /fs/nexus-projects/DVS_Encodings/EE3D-S
+      split_dir: configs/ee3d_s_splits   # subject-disjoint train/val/test (authors ship EE3D-S train-only)
+      skip_missing_units: True           # 860 units copied incrementally -> skip the not-yet-present ones
+      mask_layout: pose                  # EE3D-S: <pose>/<frame>/Segmentation/<jpg>
+      mask_person_is_dark: True          # inverted render: person = black silhouette on white
+      mask_binarize_thresh: 128          # person = gray < 128 (preview / rasterized-IoU only)
+      image_height: 480
+      image_width: 640
+      max_events: 30000            # per-event scan cost ~linear in N (was 150k). EE3D-S ~17k/frame.
+      include_unlabeled: True      # keep out-of-view frames as background negatives (free per-event labels)
+      num_classes: 1
+      augmentation:
+        enabled: False             # FISHEYE: geometric augs invalid. Leave OFF.
+  dataloader:
+    batch_size: 4                  # per-event scan is memory-heavy (was 8 for sparse-conv); 4 + grad-accum.
+    test_batch_size: 4
+    num_workers: 8
+    persistent_workers: True
+    pin_memory: True               # SparseEventBatch implements pin_memory()
+    multiprocessing_context: forkserver   # EE3D dataset __getstate__ drops h5 handles -> picklable/safe.
+    drop_last: True
+    shuffle_train: True
+    shuffle_val: False
+    shuffle_test: False
+
+MODEL:
+  file_name: event_stream_seg_s7
+  class_name: EventStreamSegS7
+  model_init_args:
+    in_features: 2                      # = EE3DEventStreamDataset.NUM_FEATURES (signed pol, t_norm)
+    embed_dim: 128
+    d_state: 64
+    ssm_layers: 2
+    use_complex: True                   # FAST: set False (real-diagonal) — see header. Kept True (accuracy-safe).
+    dual_scan: True                     # FAST: set False (drop the inert z-order scan) — see header.
+    morton_bits: 10
+    time_blocks: 6
+    fourier_bands: 8
+    down_factor: 8                      # 480x640 /8 = 60x80 context grid. 4 = sharper if memory allows.
+    context_channels: 128
+    context_depth: 2
+    head_hidden: 128
+    num_classes: 1
+    coord_mode: relative
+    motion_features: True               # plane-fit flow is only locally-approximate on fisheye but still informative
+    motion_radius: 3
+    motion_dir: False
+    motion_min_count: 6
+    density_features: True
+    density_radius: 2
+    dropout: 0.2
+    dmd_gate: True
+    dmd_gate_scale: 1.0
+    presence_gate: True                 # per-window "person present?" gate (helps the no-person frames)
+    presence_gate_weight: 0.3
+    presence_gate_scale: 1.0
+    presence_min_fg: 0
+    aux_shape_head: True
+    aux_grid: 32
+    aux_shape_weight: 0.2
+    null_loss_weight: 0.0
+    null_margin: 1.0
+    scan_weight: 0.1
+    boundary_loss_weight: 1.0
+    boundary_loss_band: 0
+    event_pool: 1
+    use_checkpoint: True                # FAST: set False when memory-light (real+no_dual) — see header.
+    gn_groups: 8
+
+OPTIMIZER:
+  name: AdamW
+  arguments:
+    lr: 3e-4
+    weight_decay: 1e-4
+  gradient_accumulation:
+    enabled: True
+    scheduling: {0: 4, 4: 2, 8: 1}
+  gradient_clip:
+    enabled: True
+    gradient_clip_val: 1.0
+    gradient_clip_algorithm: norm
+  stochastic_weight_averaging:
+    enabled: True
+    swa_lrs: 1e-4
+
+SCHEDULER:
+  learning_rate:
+    enabled: True
+    name: CosineAnnealingLR
+    arguments:
+      T_max: 50
+      eta_min: 1e-6
+  early_stopping:
+    enabled: False
+    monitor: val_loss_epoch
+    mode: min
+    patience: 5
+    min_delta: 1e-5
+
+LOGGER:
+  log_dir_root: lightning_logs
+  experiment_name: hand_event_seg_stream_s7_ee3d_s
+
+CHECKPOINT:
+  enabled: True
+  every_n_epochs: 1
+  monitor: val_event_f1_epoch
+  mode: max
+  filename: "best-{epoch:03d}-{val_event_f1_epoch:.4f}"
+  save_top_k: 1
+  save_last: True
