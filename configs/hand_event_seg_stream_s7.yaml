@@ -100,7 +100,9 @@ DATA:
     num_workers: 8
     persistent_workers: True
     pin_memory: True
-    multiprocessing_context: fork
+    multiprocessing_context: forkserver   # NOT fork: fork-after-CUDA deadlocks the DDP VAL
+                                          #   dataloader (hangs at "Validation 1/N"). Dataset is
+                                          #   picklable (lazy per-worker handles) so forkserver is safe.
     drop_last: True
     shuffle_train: True
     shuffle_val: False
