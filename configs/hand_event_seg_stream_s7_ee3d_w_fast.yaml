@@ -174,5 +174,13 @@ CHECKPOINT:
   monitor: val_event_f1_epoch
   mode: max
   filename: "best-{epoch:03d}-{val_event_f1_epoch:.4f}"
-  save_top_k: 1
+  save_top_k: -1                   # PREEMPTION-SAFETY: keep every epoch. Lightning 2.6.5 couples
+                                   #   save_last to a top-k save happening THIS step (on_validation_end:
+                                   #   `if _last_global_step_saved == global_step: _save_last_checkpoint`).
+                                   #   With save_top_k:1, an epoch whose val_event_f1 does NOT beat the
+                                   #   current best skips the top-k save AND therefore last.ckpt -> a
+                                   #   plateau/crash loses ALL progress since the last IMPROVEMENT. Seen
+                                   #   live: epoch-2 resume val 0.6088 < best 0.6108 -> nothing saved.
+                                   #   -1 saves unconditionally each epoch (48*16MB~=0.8GB) so last.ckpt
+                                   #   always updates. (Alt fix: a monitor:None 2nd ckpt callback.)
   save_last: True
