@@ -1,0 +1,195 @@
+# EventStreamSegS7 on EventEgo3D++ / EE3D-W — ROPE variant (the SSD-rewrite ACCURACY GATE).
+# ---------------------------------------------------------------------------------------
+# Identical to hand_event_seg_stream_s7_ee3d_w_fast.yaml (the complex baseline currently
+# training) EXCEPT the SSM diagonal: use_complex False + rope True + scan_impl torch. This
+# swaps the complex Koopman diagonal for a REAL decay diagonal (the form the Mamba-2 SSD
+# tensor-core kernel can express) with the complex/oscillatory transition RECONSTRUCTED by a
+# Mamba-3-style data-dependent rotary on the drive/readout (keeps complex B/C i/o maps).
+#
+# PURPOSE = Stage-1 gate of docs/deep_research_s7_10M_events_per_sec.md: does real-diagonal +
+# RoPE hold val_event_f1 / val_event_f1_best vs the complex baseline? Train matched ~8 epochs
+# and compare. If it HOLDS -> the real SSD kernel path (scan_impl:ssd, Stage 2) is unlocked
+# for the ~2-2.5x speedup. If it DROPS -> RoPE doesn't compensate on this task; keep complex.
+# Smoke-verified: rope(bridge-init) == complex scan to 2.4e-7 (tools/smoke_test_event_stream_s7.py
+# §11-13). This is a NEW trained model (the real diagonal changes the state_dict key set), NOT
+# a resume of the complex run.
+#
+# DATA: EE3D-W is REAL in-the-wild egocentric FISHEYE person (full-body) seg. Split is the
+# author on-disk split (train=Session_1,2,4,6,7 val=5,9 test=3,8 via train/val/test.txt at
+# the data root) — a proper session-disjoint 5/2/2, ALL sessions present on disk, so it is
+# used as-is (no custom split, unlike EE3D-S whose author split was degenerate 855/4/1).
+# FISHEYE: geometric augmentation is INVALID (kept OFF) — do NOT enable hflip/affine/rotate.
+
+TRAINING:
+  deterministic: False
+  use_compile: False
+  inference_mode: False
+  seed: 42
+  max_epochs: 50
+  num_sanity_val_steps: 0
+  # Val is loaded SINGLE-PROCESS (dataloader.val_num_workers: 0) to dodge the DDP
+  # val-dataloader worker-spawn deadlock (EE3D h5/memmap init hangs 4-rank forkserver even
+  # though it's fine at devices:1 / on the hand dataset). Cap the oversized val set so
+  # single-threaded loading stays fast. EE3D-W val = sessions 5,9 (large), so a bounded
+  # prefix is plenty to monitor val_event_f1.
+  # FAST SMOKE (reach validation in ~1 min instead of full epoch): add limit_train_batches: 50.
+  limit_val_batches: 300
+  task: event_segmentation
+  event_loss_config:
+    bce_weight: 0.0
+    pos_weight: 2.0                    # person fg is larger than hand; pos_weight can be lowered to ~1.
+    gjs_weight: 1.0
+    gjs_pi1: 0.5
+    lovasz_weight: 1.0
+  event_eval_config:
+    thr_min: 0.05
+    thr_max: 0.95
+    thr_steps: 19
+    clean_enabled: True
+    clean_open_ksize: 3
+    clean_keep_largest: False
+    clean_min_area: 0
+  val_preview_count: 0             # DDP hang fix: the val-preview renders a per-session mp4
+                                   #   (e.g. Session_9 = 597 frames) on rank 0 ONLY; on EE3D-W's
+                                   #   large sessions that blocks long enough that ranks 1-3 spin
+                                   #   at the epoch-end NCCL collective -> asymmetric hang. Off = safe.
+
+DISTRIBUTED:
+  accelerator: gpu
+  devices: 4
+  num_nodes: 1
+  strategy: auto
+
+DATA:
+  dataset:
+    file_name: ee3d_event_dataset
+    class_name: EE3DEventStreamDataset
+    dataset_init_args:
+      root_dir: /fs/nexus-projects/DVS_Encodings/EE3D-W
+      image_height: 480
+      image_width: 640
+      max_events: 30000            # per-event scan cost ~linear in N (was 150k for the sparse-conv
+                                  #   baseline). EE3D frames are ~17k events so 30k rarely binds.
+      include_unlabeled: True      # keep no-person frames as background negatives (free per-event labels)
+      mask_binarize_thresh: 8      # Blender JPG (lossy) -> binary silhouette for previews / rasterized IoU
+      num_classes: 1
+      augmentation:
+        enabled: False             # FISHEYE: geometric augs invalid. Leave OFF.
+  dataloader:
+    batch_size: 4                  # per-event scan is memory-heavy (was 8 for sparse-conv); 4 + grad-accum.
+    test_batch_size: 4
+    num_workers: 8
+    val_num_workers: 0             # DDP val deadlock fix: single-process val (no worker spawn). See TRAINING.limit_val_batches.
+    persistent_workers: True
+    pin_memory: True               # SparseEventBatch implements pin_memory()
+    multiprocessing_context: forkserver   # EE3D dataset __getstate__ drops h5 handles -> picklable/safe.
+    drop_last: True
+    shuffle_train: True
+    shuffle_val: False
+    shuffle_test: False
+
+MODEL:
+  file_name: event_stream_seg_s7
+  class_name: EventStreamSegS7
+  model_init_args:
+    in_features: 2                      # = EE3DEventStreamDataset.NUM_FEATURES (signed pol, t_norm)
+    embed_dim: 128
+    d_state: 64
+    ssm_layers: 2
+    use_complex: False                  # ROPE variant: real DIAGONAL (the SSD-kernel-compatible form).
+    rope: True                          # Mamba-3 "RoPE trick": a data-dependent rotary on the drive/readout
+                                        #   reconstructs the complex/oscillatory transition on the real diagonal
+                                        #   (drops the fixed Koopman a_im, KEEPS the complex B/C i/o maps). This
+                                        #   is the ACCURACY GATE -> does real+RoPE hold val_event_f1 vs the
+                                        #   complex baseline (hand_event_seg_stream_s7_ee3d_w_fast.yaml)? If yes,
+                                        #   the real Mamba-2 SSD kernel path (scan_impl:ssd, Stage 2) is unlocked.
+    scan_impl: torch                    # torch reference scan (identical here to complex plumbing). The SSD
+                                        #   tensor-core kernel is Stage 2 and NOT built yet.
+    dual_scan: False                    # matched to the complex baseline for a clean 1-variable comparison.
+    morton_bits: 10
+    time_blocks: 6
+    fourier_bands: 8
+    down_factor: 8                      # 480x640 /8 = 60x80 context grid. 4 = sharper if memory allows.
+    context_channels: 128
+    context_depth: 2
+    head_hidden: 128
+    num_classes: 1
+    coord_mode: relative
+    motion_features: True               # plane-fit flow is only locally-approximate on fisheye but still informative
+    motion_radius: 3
+    motion_dir: False
+    motion_min_count: 6
+    density_features: True
+    density_radius: 2
+    dropout: 0.2
+    dmd_gate: True
+    dmd_gate_scale: 1.0
+    presence_gate: True                 # per-window "person present?" gate (helps the no-person frames)
+    presence_gate_weight: 0.3
+    presence_gate_scale: 1.0
+    presence_min_fg: 0
+    aux_shape_head: True
+    aux_grid: 32
+    aux_shape_weight: 0.2
+    null_loss_weight: 0.0
+    null_margin: 1.0
+    scan_weight: 0.1                    # dual-scan consistency (ignored now that dual_scan: False)
+    boundary_loss_weight: 1.0
+    boundary_loss_band: 0
+    event_pool: 1
+    use_checkpoint: True                # 24GB A5000 (tron46) resume: gradient-checkpoint ON = MATHEMATICALLY
+                                        #   IDENTICAL fwd/bwd (same weights+optimizer trajectory -> resume-safe),
+                                        #   just trades memory for ~1.3x. Was False on the 46GB L40S. Keeps the
+                                        #   2.8x from dual_scan:False. On 24GB, checkpoint-OFF risks OOM.
+    gn_groups: 8
+
+OPTIMIZER:
+  name: AdamW
+  arguments:
+    lr: 3e-4
+    weight_decay: 1e-4
+  gradient_accumulation:
+    enabled: True
+    scheduling: {0: 4, 4: 2, 8: 1}
+  gradient_clip:
+    enabled: True
+    gradient_clip_val: 1.0
+    gradient_clip_algorithm: norm
+  stochastic_weight_averaging:
+    enabled: True
+    swa_lrs: 1e-4
+
+SCHEDULER:
+  learning_rate:
+    enabled: True
+    name: CosineAnnealingLR
+    arguments:
+      T_max: 50
+      eta_min: 1e-6
+  early_stopping:
+    enabled: False
+    monitor: val_loss_epoch
+    mode: min
+    patience: 5
+    min_delta: 1e-5
+
+LOGGER:
+  log_dir_root: lightning_logs
+  experiment_name: hand_event_seg_stream_s7_ee3d_w_rope
+
+CHECKPOINT:
+  enabled: True
+  every_n_epochs: 1
+  monitor: val_event_f1_epoch
+  mode: max
+  filename: "best-{epoch:03d}-{val_event_f1_epoch:.4f}"
+  save_top_k: -1                   # PREEMPTION-SAFETY: keep every epoch. Lightning 2.6.5 couples
+                                   #   save_last to a top-k save happening THIS step (on_validation_end:
+                                   #   `if _last_global_step_saved == global_step: _save_last_checkpoint`).
+                                   #   With save_top_k:1, an epoch whose val_event_f1 does NOT beat the
+                                   #   current best skips the top-k save AND therefore last.ckpt -> a
+                                   #   plateau/crash loses ALL progress since the last IMPROVEMENT. Seen
+                                   #   live: epoch-2 resume val 0.6088 < best 0.6108 -> nothing saved.
+                                   #   -1 saves unconditionally each epoch (48*16MB~=0.8GB) so last.ckpt
+                                   #   always updates. (Alt fix: a monitor:None 2nd ckpt callback.)
+  save_last: True

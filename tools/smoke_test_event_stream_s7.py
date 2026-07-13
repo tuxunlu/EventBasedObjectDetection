@@ -300,6 +300,91 @@ def main():
     _check("real-diagonal: grad flows into a_log/B_re/C_re/delta_proj", len(got_grad) == 4,
            f"{got_grad}")
 
+    print("== 11-13. RoPE hedge (real diagonal + Mamba-3 rotary) — the accuracy gate ==")
+    # A segmented scan input at the _SelectiveSSM level (isolates the scan math from the
+    # per-event feature front-end). Three segments; small positive Δt.
+    dU, NU = 32, 8
+    seg = torch.cat([torch.zeros(12), torch.ones(20), torch.full((7,), 2)]).long()
+    posU, ssU, slU, mlU = _seg_layout(seg, 3)
+    xU = torch.randn(seg.numel(), dU)
+    dtU = torch.rand(seg.numel()) * 0.1
+
+    def _copy_shared(dst, src, names):
+        with torch.no_grad():
+            for n in names:
+                getattr(dst, n).copy_(getattr(src, n))
+            dst.delta_proj.weight.copy_(src.delta_proj.weight)
+            dst.delta_proj.bias.copy_(src.delta_proj.bias)
+            dst.gate_proj.weight.copy_(src.gate_proj.weight)
+            dst.gate_proj.bias.copy_(src.gate_proj.bias)
+
+    # §12 equivalence bridge: rope(bridge-init) reproduces the complex scan exactly. Share
+    # all maps; set rope_base = a_im and rope_proj = 0 so per-step angle θ = a_im·Δ = φ.
+    m_cx = _SelectiveSSM(dU, NU, use_complex=True).eval()
+    m_rp = _SelectiveSSM(dU, NU, use_complex=False, rope=True).eval()
+    _copy_shared(m_rp, m_cx, ["a_log", "B_re", "C_re", "D", "B_im", "C_im"])
+    with torch.no_grad():
+        m_rp.rope_base.copy_(m_cx.a_im)
+        m_rp.rope_proj.weight.zero_(); m_rp.rope_proj.bias.zero_()
+        y_cx = m_cx._scan_once(xU, dtU, posU, mlU)
+        y_rp = m_rp._scan_once(xU, dtU, posU, mlU)
+    err12 = (y_cx - y_rp).abs().max().item()
+    _check("§12 equivalence bridge: rope(bridge-init) == complex scan", err12 < 1e-4,
+           f"max|Δ|={err12:.2e}")
+
+    # §11 RoPE-identity: with Θ≡0 (rope_base=0) and no complex maps (B_im=C_im=0), the rope
+    # path collapses to the plain real-diagonal path.
+    m_re0 = _SelectiveSSM(dU, NU, use_complex=False).eval()
+    m_r0 = _SelectiveSSM(dU, NU, use_complex=False, rope=True).eval()
+    _copy_shared(m_r0, m_re0, ["a_log", "B_re", "C_re", "D"])
+    with torch.no_grad():
+        m_r0.rope_base.zero_(); m_r0.rope_proj.weight.zero_(); m_r0.rope_proj.bias.zero_()
+        m_r0.B_im.zero_(); m_r0.C_im.zero_()
+        y_re0 = m_re0._scan_once(xU, dtU, posU, mlU)
+        y_r0 = m_r0._scan_once(xU, dtU, posU, mlU)
+    err11 = (y_re0 - y_r0).abs().max().item()
+    _check("§11 RoPE-identity: Θ≡0 & B_im=C_im=0 == plain real-diagonal", err11 < 1e-5,
+           f"max|Δ|={err11:.2e}")
+
+    # §13 discriminative: plain real-diagonal (drop a_im/B_im/C_im) on the SAME shared params
+    # DIVERGES materially from the complex scan, while rope (§12) matches it — i.e. RoPE
+    # recovers oscillatory expressivity that pure decay cannot.
+    m_re3 = _SelectiveSSM(dU, NU, use_complex=False).eval()
+    _copy_shared(m_re3, m_cx, ["a_log", "B_re", "C_re", "D"])
+    with torch.no_grad():
+        y_re3 = m_re3._scan_once(xU, dtU, posU, mlU)
+    gap13 = (y_re3 - y_cx).abs().max().item()
+    _check("§13 plain real DIVERGES from complex, rope recovers it",
+           gap13 > 1e-2 and err12 < 1e-4, f"real-gap={gap13:.2e}, rope-gap={err12:.2e}")
+
+    # Full-model contract + gradient flow for the trainable rope variant.
+    m_rope = EventStreamSegS7(use_complex=False, rope=True).eval()
+    rpb = _batch(2500, H, W, B, gen)
+    n_rpb = rpb.coords.shape[0]
+    with torch.no_grad():
+        lrp = m_rope(rpb); lrp2 = m_rope(rpb)
+    _check("rope model: one finite logit per event, deterministic",
+           tuple(lrp.shape) == (n_rpb,) and torch.isfinite(lrp).all().item()
+           and torch.equal(lrp, lrp2))
+    _check("rope model: no complex params, exposes rope_proj + rope_base buffer",
+           not any(torch.is_complex(p) for p in m_rope.parameters())
+           and any(n.endswith("rope_proj.weight") for n, _ in m_rope.named_parameters())
+           and any(n.endswith("rope_base") for n, _ in m_rope.named_buffers()))
+    _check("rope model: _freqs exposed = rope base freqs (nonzero)",
+           m_rope._freqs is not None and tuple(m_rope._freqs.shape) == (m_rope.d_state,)
+           and float(m_rope._freqs.abs().max()) > 0.0)
+    m_rope.train()
+    lrp_tr = m_rope(rpb)
+    loss_rp = loss_fn(lrp_tr, rpb.labels, batch_idx=rpb.batch_idx)["total"]
+    loss_rp.backward()
+    rp_params = dict(m_rope.named_parameters())
+    got_rope = [n for n in ("time_blocks_mod.0.ssm.rope_proj.weight", "time_blocks_mod.0.ssm.a_log",
+                            "time_blocks_mod.0.ssm.B_im", "time_blocks_mod.0.ssm.C_im")
+                if rp_params.get(n) is not None and rp_params[n].grad is not None
+                and torch.isfinite(rp_params[n].grad).all()]
+    _check("rope model: grad flows into rope_proj/a_log/B_im/C_im", len(got_rope) == 4,
+           f"{got_rope}")
+
     print()
     if FAILED:
         print(f"SMOKE TEST FAILED ({len(FAILED)}): {FAILED}")

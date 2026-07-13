@@ -125,7 +125,7 @@ class _SelectiveSSM(nn.Module):
     """
 
     def __init__(self, d_model: int, d_state: int = 64, bidirectional: bool = False,
-                 use_complex: bool = True):
+                 use_complex: bool = True, rope: bool = False, scan_impl: str = "torch"):
         super().__init__()
         self.d_model = int(d_model)
         self.N = int(d_state)
@@ -136,17 +136,34 @@ class _SelectiveSSM(nn.Module):
         #   Mamba-2 SSD chunkwise kernel, so this flag is the R1 gate for the SSD rewrite
         #   (see docs/deep_research_s7_faster_capable.md / the research plan).
         self.use_complex = bool(use_complex)
+        # rope=True -> real-diagonal TRANSITION (r=exp(a_re·Δ), SSD-kernel compatible) with
+        #   the complex/oscillatory transition RECONSTRUCTED by a data-dependent rotary on the
+        #   drive (R(-Θ) in) and readout state (R(+Θ) out) -- the Mamba-3 "RoPE trick". It
+        #   drops the fixed Koopman diagonal a_im (replaced by rope_proj + rope_base) but KEEPS
+        #   the complex input/output maps B_im,C_im (they carry input/output expressivity and
+        #   are applied OUTSIDE the scan). Mutually exclusive with use_complex. This is the
+        #   accuracy hedge for the SSD rewrite -- see docs/deep_research_s7_10M_events_per_sec.md.
+        self.rope = bool(rope)
+        # Scan primitive: "torch" = the pure-PyTorch _segmented_scan (reference/fallback);
+        #   "ssd" = the Mamba-2 SSD tensor-core kernel (Stage 2, not built yet).
+        self.scan_impl = str(scan_impl).strip().lower()
+        if self.rope and self.use_complex:
+            raise ValueError("rope=True implies a real diagonal; set use_complex=False.")
+        if self.scan_impl not in ("torch", "ssd"):
+            raise ValueError(f"scan_impl must be torch|ssd, got {scan_impl!r}")
         # Stable diagonal continuous eigenvalues (real part < 0 via -softplus).
         self.a_log = nn.Parameter(torch.log(torch.expm1(0.5 * torch.ones(self.N))))
         # MIMO input/output maps (real params; complex assembled in forward when complex).
         self.B_re = nn.Parameter(torch.randn(self.N, d_model) / math.sqrt(d_model))
         self.C_re = nn.Parameter(torch.randn(d_model, self.N) / math.sqrt(self.N))
         self.D = nn.Parameter(torch.ones(d_model))
-        # The complex/oscillatory (Koopman) half: imaginary eigen-FREQUENCIES a_im and the
-        # imaginary halves of B, C. Present ONLY in complex mode; the real-diagonal ablation
-        # drops them (~2·N·d_model + N fewer params) -> a plain decay SSM, no oscillation.
+        # Imaginary eigen-FREQUENCIES a_im -- complex mode ONLY (rope replaces them with the
+        # rotary; the plain real-diagonal ablation drops them for pure decay, no oscillation).
         if self.use_complex:
             self.a_im = nn.Parameter(torch.linspace(0.0, math.pi, self.N))
+        # Imaginary halves of the input/output maps B, C -- present in complex mode AND rope
+        # mode (the rotary reconstructs the transition; complex B/C keep i/o expressivity).
+        if self.use_complex or self.rope:
             self.B_im = nn.Parameter(torch.zeros(self.N, d_model))
             self.C_im = nn.Parameter(torch.randn(d_model, self.N) / math.sqrt(self.N))
         # Selectivity: input-dependent Δ (scalar/event) and input gate (per mode).
@@ -154,12 +171,52 @@ class _SelectiveSSM(nn.Module):
         self.gate_proj = nn.Linear(d_model, self.N)
         nn.init.zeros_(self.delta_proj.weight)
         nn.init.constant_(self.delta_proj.bias, 0.0)   # softplus(0)=~0.69 initial scale
+        # Data-dependent rotary: a per-event additive shift to fixed per-mode base
+        # frequencies. Init (zero weight/bias) -> theta = rope_base·Δ, i.e. the complex
+        # model's frequencies at init (the equivalence-bridge init); rope_base mirrors a_im.
+        if self.rope:
+            self.rope_proj = nn.Linear(d_model, self.N)
+            nn.init.zeros_(self.rope_proj.weight)
+            nn.init.zeros_(self.rope_proj.bias)
+            self.register_buffer("rope_base", torch.linspace(0.0, math.pi, self.N))
+
+    def _scan_rope_torch(self, x, delta, g, a_re, pos_in_seg, max_len):
+        """Real-diagonal decay scan with the Mamba-3 rotary (torch reference).
+
+        Reconstructs the complex transition without a complex diagonal: rotate the drive in
+        by ``R(-Θ)``, run a REAL decay scan ``r = exp(a_re·Δ)`` (this is the SSD-kernel-
+        compatible primitive), rotate the state out by ``R(+Θ)``, then read out
+        ``Re(H Cᵀ) + x D``. ``Θ`` is the per-segment inclusive cumulative angle. Algebra:
+        ``H_k = e^{iΘ_k} · Σ_{j≤k} ρ_{j→k} e^{-iΘ_j} u_j``, which equals the complex scan
+        ``h_k`` when the per-step angle ``θ_k = a_im·Δ_k`` (the equivalence bridge)."""
+        # per-event, per-mode angular step and its per-segment inclusive cumsum Θ (reuse the
+        # segmented scan with Ā≡1 = a reset-aware prefix sum). rope_proj is a data-dependent
+        # additive shift to the fixed base frequencies.
+        theta = (self.rope_base.unsqueeze(0) + self.rope_proj(x)) * delta.unsqueeze(1)  # (M,N)
+        Theta = _segmented_scan(torch.ones_like(theta), theta, pos_in_seg, max_len)     # (M,N)
+        rot = torch.polar(torch.ones_like(Theta), Theta)             # e^{iΘ} (M,N) |·|=1
+        # complex drive u = Δ·g·(B x); rotate in by R(-Θ) = conj(rot).
+        xB = x @ self.B_re.t() + 1j * (x @ self.B_im.t())            # (M,N) complex
+        u = (delta.unsqueeze(1) * g).to(xB.dtype) * xB              # (M,N) complex drive
+        u_tilde = u * rot.conj()                                     # R(-Θ) u
+        r = torch.exp(a_re.unsqueeze(0) * delta.unsqueeze(1))       # (M,N) real decay ∈(0,1)
+        h_tilde = _segmented_scan(r.to(u_tilde.dtype), u_tilde, pos_in_seg, max_len)  # (M,N)
+        H = h_tilde * rot                                            # R(+Θ) h~ = complex state
+        C = torch.complex(self.C_re, self.C_im)                     # (d,N)
+        y = (H @ C.t()).real + x * self.D                           # (M,d)
+        return y
 
     def _scan_once(self, x, dt, pos_in_seg, max_len):
         """One directional selective scan over the ordered sequence ``x (M,d)``."""
+        if self.scan_impl == "ssd":
+            raise NotImplementedError(
+                "scan_impl='ssd' (Mamba-2 SSD tensor-core kernel) is Stage 2 of the plan "
+                "and is not built yet; use scan_impl='torch'.")
         a_re = -F.softplus(self.a_log)                                 # (N,) Re<0
         delta = F.softplus(self.delta_proj(x).squeeze(-1)) * dt        # (M,)
         g = F.softplus(self.gate_proj(x))                             # (M,N) input gate
+        if self.rope:
+            return self._scan_rope_torch(x, delta, g, a_re, pos_in_seg, max_len)
         if self.use_complex:
             A = torch.complex(a_re, self.a_im)                        # (N,) continuous
             Abar = torch.exp(A.unsqueeze(0) * delta.unsqueeze(1).to(A.dtype))  # (M,N)
@@ -185,8 +242,14 @@ class _SelectiveSSM(nn.Module):
             y_b = self._scan_once(x[rev], dt[rev], pos_in_seg, max_len)
             y = y + y_b[rev]
         # Diagnostic "freqs" for the DMD/Koopman hooks: the imaginary eigenvalues in
-        # complex mode, zeros (no oscillation) in the real-diagonal ablation.
-        freqs = self.a_im if self.use_complex else x.new_zeros(self.N)
+        # complex mode, the rotary base frequencies in rope mode, zeros (no oscillation)
+        # in the plain real-diagonal ablation.
+        if self.use_complex:
+            freqs = self.a_im
+        elif self.rope:
+            freqs = self.rope_base
+        else:
+            freqs = x.new_zeros(self.N)
         return y, freqs
 
 
@@ -194,11 +257,11 @@ class _SelectiveSSMBlock(nn.Module):
     """Residual selective-SSM block: ``x + out_proj(SSM(norm(x)) ⊙ SiLU(gate(x)))``."""
 
     def __init__(self, d_model: int, d_state: int, bidirectional: bool = False,
-                 use_complex: bool = True):
+                 use_complex: bool = True, rope: bool = False, scan_impl: str = "torch"):
         super().__init__()
         self.norm = nn.LayerNorm(d_model)
         self.ssm = _SelectiveSSM(d_model, d_state, bidirectional=bidirectional,
-                                 use_complex=use_complex)
+                                 use_complex=use_complex, rope=rope, scan_impl=scan_impl)
         self.gate = nn.Linear(d_model, d_model)
         self.out_proj = nn.Linear(d_model, d_model)
 
@@ -302,6 +365,8 @@ class EventStreamSegS7(nn.Module):
         d_state: int = 64,
         ssm_layers: int = 4,
         use_complex: bool = True,
+        rope: bool = False,
+        scan_impl: str = "torch",
         dual_scan: bool = True,
         morton_bits: int = 10,
         time_blocks: int = 6,
@@ -342,6 +407,11 @@ class EventStreamSegS7(nn.Module):
         self.embed_dim = int(embed_dim)
         self.d_state = int(d_state)
         self.use_complex = bool(use_complex)
+        # rope + scan_impl: the SSD-rewrite hedge/switch (see _SelectiveSSM). rope=True keeps
+        # the model per-event but swaps the complex diagonal for a real decay + data-dependent
+        # rotary; scan_impl selects the scan primitive ("torch" reference / "ssd" kernel).
+        self.rope = bool(rope)
+        self.scan_impl = str(scan_impl).strip().lower()
         self.num_classes = int(num_classes)
         self.dual_scan = bool(dual_scan)
         self.morton_bits = int(morton_bits)
@@ -419,12 +489,14 @@ class EventStreamSegS7(nn.Module):
         L = max(1, int(ssm_layers))
         self.time_blocks_mod = nn.ModuleList(
             _SelectiveSSMBlock(d, self.d_state, bidirectional=False,
-                               use_complex=self.use_complex) for _ in range(L))
+                               use_complex=self.use_complex, rope=self.rope,
+                               scan_impl=self.scan_impl) for _ in range(L))
         self.time_norm = nn.LayerNorm(d)
         if self.dual_scan:
             self.zorder_blocks = nn.ModuleList(
                 _SelectiveSSMBlock(d, self.d_state, bidirectional=True,
-                                   use_complex=self.use_complex) for _ in range(L))
+                                   use_complex=self.use_complex, rope=self.rope,
+                                   scan_impl=self.scan_impl) for _ in range(L))
             self.zorder_norm = nn.LayerNorm(d)
             # Shared probe for the dual-scan consistency aux. Only created when the term
             # is actually used (scan_weight>0), else it would be a dead parameter that
