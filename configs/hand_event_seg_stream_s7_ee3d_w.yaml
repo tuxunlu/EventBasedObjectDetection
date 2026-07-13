@@ -44,7 +44,10 @@ TRAINING:
     clean_open_ksize: 3
     clean_keep_largest: False
     clean_min_area: 0
-  val_preview_count: 8
+  val_preview_count: 0             # DDP hang fix: the val-preview renders a per-session mp4
+                                   #   (e.g. Session_9 = 597 frames) on rank 0 ONLY; on EE3D-W's
+                                   #   large sessions that blocks long enough that ranks 1-3 spin
+                                   #   at the epoch-end NCCL collective -> asymmetric hang. Off = safe.
 
 DISTRIBUTED:
   accelerator: gpu
