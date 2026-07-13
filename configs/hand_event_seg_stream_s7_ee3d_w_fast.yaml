@@ -128,7 +128,10 @@ MODEL:
     boundary_loss_weight: 1.0
     boundary_loss_band: 0
     event_pool: 1
-    use_checkpoint: False               # FAST: identical math, more memory. OOM -> set True (keeps 2.8x) or batch 2.
+    use_checkpoint: True                # 24GB A5000 (tron46) resume: gradient-checkpoint ON = MATHEMATICALLY
+                                        #   IDENTICAL fwd/bwd (same weights+optimizer trajectory -> resume-safe),
+                                        #   just trades memory for ~1.3x. Was False on the 46GB L40S. Keeps the
+                                        #   2.8x from dual_scan:False. On 24GB, checkpoint-OFF risks OOM.
     gn_groups: 8
 
 OPTIMIZER:
